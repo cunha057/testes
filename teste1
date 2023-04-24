@@ -1,0 +1,2413 @@
+public static int ExecuteDispoManager(DBConnect dbConn, LC.Globals.DTO.SystemSettings systemSettings,
+    LC.LCFunctions.PollingInterface polling, ExecuteDispoManagerRequest request)
+{
+    if (dbConn.Transaction != null)
+        throw new Exception("Please enter ExecuteDispoManager without transaction!");
+
+
+    int result = 0;
+    string sqlCommand = "";                         // Variable für SqlStatements
+    string where = "";                              // WhereBedingung für Selektion betreffender Artikel
+    DataSet dsItems = null;                         // DataSet mit den Artikel aus der Abfrage
+    DataSet dsTemp = null;                          // DataSet für diverse Datenbankabfragen
+    double? anTmpInx = null;                        // Index für Vorbereitung Artikel aus EK_Kond für Multikonditionen
+    double? anBgInx = null;                         // Index für Vorbereitung Baugruppen ohne Definition zur Standardvariante des Hauptlieferanten
+    bool isProductionStockInSelection = false;      // Kennzeichen ob in der Selektion ein Produktionslager vorhanden ist.
+    List<decimal?> allActiveProjectStocks = new List<decimal?>();   //Liste aller aktiven Projektlager
+    List<string> processedItemsFirstStock = new List<string>();     //Liste aller Artikel, deren offene Mengen bereits für die erste Lagernummer gelesen wurden
+
+    // Dictonary der organisatorischen Einheiten mit Angabe des Produktionslagers erstellen
+    Dictionary<double, double> orgUnits = LC.LCFunctions.MasterData.OrganisationUnits.OrganisationUnits.GetProductionStockDictonary(dbConn);
+
+    // Stopuhr Klasse für Dauer der Funktion
+    LC.Globals.StopClock stopClock = new Globals.StopClock();
+    stopClock.Start();
+
+    // Lagernummer der organisatorischen Einheit des angemeldeten Benutzers einlesen
+    double? userOrgUnitStockNo = null;
+    if (!double.IsNaN(request.UserOrgUnit))
+    {
+        sqlCommand = "select lager from filialen where nummer=:nummer";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("nummer", PollexDBType.Number, request.UserOrgUnit);
+        object obj = dbConn.ExecuteScalar(sqlCommand);
+        if (obj != null)
+            userOrgUnitStockNo = obj.ParseDoubleN();
+    }
+
+    #region Aktualisierung NULL Spalten im Artikelstamm
+    try
+    {
+        dbConn.BeginTransaction(IsolationLevel.ReadCommitted);
+
+        // Kennzeichen Gesperrt prüfen
+        sqlCommand = "update artikelstamm set gesperrt=:gesperrt where gesperrt is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("gesperrt", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Sammelartikel prüfen
+        sqlCommand = "update artikelstamm set sammelartikel=:sammelartikel where sammelartikel is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("sammelartikel", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Kein Bestellvorschlag prüfen
+        sqlCommand = "update artikelstamm set kein_bvo=:kein_bvo where kein_bvo is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("kein_bvo", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Auslaufartikel prüfen
+        sqlCommand = "update artikelstamm set auslauf=:auslauf where auslauf is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("auslauf", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Durchlaufartikel prüfen
+        sqlCommand = "update artikelstamm set durchlauf=:durchlauf where durchlauf is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("durchlauf", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Baugruppenartikel prüfen
+        sqlCommand = "update artikelstamm set bg=:bg where bg is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("bg", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Artikel unvollständig prüfen
+        sqlCommand = "update artikelstamm set unvollst=:unvollst where unvollst is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("unvollst", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        // Kennzeichen Ersatzteil prüfen
+        sqlCommand = "update artikelstamm set ersatzteil=:ersatzteil where ersatzteil is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("ersatzteil", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+        //AL: 21.04.2020
+        // Kennzeichen Produktion prüfen
+        sqlCommand = "update artikelstamm set produktion=:produktion where produktion is null";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("produktion", PollexDBType.Bool, false);
+        dbConn.ExecuteCommand(sqlCommand);
+
+        dbConn.Commit();
+    }
+    catch
+    {
+        if (dbConn != null && dbConn.Transaction != null)
+            dbConn.Rollback();
+
+        throw;
+    }
+
+    #endregion Aktualisierung NULL Spalten im Artikelstamm
+
+
+    var stockSettings = GetStockSettings(dbConn, request.StockNumber);
+
+    try
+    {
+        dbConn.BeginTransaction(IsolationLevel.ReadCommitted);
+
+        #region ev. bestehende Datensätze des Profils löschen
+        sqlCommand = "delete from bestellvorschlag where bestellinx is null and fainx is null and profil=:profil";
+        dbConn.CreateCommand();
+        dbConn.AddParameter("profil", PollexDBType.Number, request.ProfileNumber);
+        dbConn.ExecuteCommand(sqlCommand);
+        #endregion
+        #region Vorbereitung der Tabelle AN_TMP für Artikel die nicht in Multikonditionen vewendet werden
+        if (request.ItemsWithoutMultiCondition)
+        {
+            // Temporäre Tabelle AN_TMP mit den Artikel befüllen, welche in Multikonditionen vorkommen
+            anTmpInx = dbConn.NeuerIndex("INX");
+
+            // Alle Artikeln über Artikelnummer einfügen
+            sqlCommand = "insert into an_tmp ( inx, artikelnummer ) select :inx,artikelnummer from ek_kond where not artikelnummer is null " +
+                "and not multikondition is null";
+            dbConn.CreateCommand();
+            dbConn.AddParameter("inx", PollexDBType.Number, anTmpInx.Value);
+            dbConn.ExecuteCommand(sqlCommand);
+
+            // Artikel über alle Kombinationen der Artikelkriterien in die Tabelle AN_TMP einfügen
+            sqlCommand = "select distinct liefnr as lieferantennummer, hauptgruppe, sortiment, gruppe, reihe, hersteller, user1, user2, user3 " +
+                "from ek_kond where artikelnummer is null and not multikondition is null";
+            DataSet dsMulti = dbConn.FillDataSet(sqlCommand);
+            if (dsMulti != null && dsMulti.Tables.Count > 0 && dsMulti.Tables[0].Rows.Count > 0)
+            {
+                foreach (DataRow row in dsMulti.Tables[0].Rows)
+                {
+                    // Sql Statememnt mit Where Bedingung zusammenbauen
+                    sqlCommand = "insert into an_tmp ( inx, artikelnummer ) select :inx,artikelnummer from artikelstamm where 1=1 ";
+
+                    // CreateCommand hier auswühren wegen AddParamater im Loop
+                    dbConn.CreateCommand();
+
+                    foreach (DataColumn c in dsMulti.Tables[0].Columns)
+                    {
+                        if (row[c].ToString() != "")
+                        {
+                            sqlCommand += " and " + c.ColumnName + "=:" + c.ColumnName + " ";
+                            if (c.ColumnName == "LIEFERANTENNUMMER")
+                            {
+                                dbConn.AddParameter(c.ColumnName, PollexDBType.Number, row[c].ParseDouble());
+                            }
+                            else
+                            {
+                                dbConn.AddParameter(c.ColumnName, PollexDBType.Varchar, row[c].ParseDouble());
+                            }
+                        }
+                    }
+
+                    // Einfügen in Tabelle AN_TMP
+                    dbConn.AddParameter("inx", PollexDBType.Number, anTmpInx.Value);
+                    dbConn.ExecuteCommand(sqlCommand);
+                }
+            }
+        }
+        #endregion Vorbereitung der Tabelle AN_TMP für Artikel die nicht in Multikonditionen vewendet werden
+        #region Vorbereitung der Tabelle AN_TMP für Baugruppen ohne Definition zur Standardvariante des Hauptlieferanten
+        if (request.AssemblyItems.HasValue && request.WithVariantCheck)
+        {
+            // Temporäre Tabelle AN_TMP mit den Baugruppen aus der Abfragebedingung selektieren
+            anBgInx = dbConn.NeuerIndex("INX");
+
+            // CreateCommand hier ausführen wegen der Wherebedingungen
+            dbConn.CreateCommand();
+
+            where = "";
+            BuildWhereCondition(dbConn, request, request.StockNumber, ref where);
+
+            // DataSet mit den Baugruppen aus der Where Bedingung erstellen
+            sqlCommand = "select a.artikelnummer,a.bezeichnung1,l.default_variante from artikelstamm a, alief l where a.artikelnummer=l.artikelnummer " +
+                "and a.lieferantennummer=l.liefnummer and a.lartikelnummer=l.l_artikelnummer and a.aktiv=:aktiv and a.artikelart=:artikelart " +
+                "and a.sammelartikel=:sammelartikel and a.kein_bvo=:kein_bvo and a.bg=:bg " + where + " order by a.artikelnummer";
+            dbConn.AddParameter("aktiv", PollexDBType.Bool, true);
+            dbConn.AddParameter("artikelart", PollexDBType.Varchar, "M");
+            dbConn.AddParameter("sammelartikel", PollexDBType.Bool, false);
+            dbConn.AddParameter("kein_bvo", PollexDBType.Bool, false);
+            dbConn.AddParameter("bg", PollexDBType.Bool, true);
+            dsItems = dbConn.FillDataSet(sqlCommand);
+            if (dsItems != null && dsItems.Tables.Count > 0 && dsItems.Tables[0].Rows.Count > 0)
+            {
+                //polling.SetNextAction("Checking assembly items...", dsItems.Tables[0].Rows.Count);
+                foreach (DataRow drItem in dsItems.Tables[0].Rows)
+                {
+                    string itemNo = drItem["ARTIKELNUMMER"].ToString();
+                    string defaultVariant = drItem["DEFAULT_VARIANTE"].ToString();
+                    //polling.SetAsyncInfo("Item " + itemNo + " in progress...");
+                    //polling.IncCurrentCount();
+
+                    // Sql Statement für Prüfung auf die Standardvariante
+                    sqlCommand = "select artikelnummer from artikellisten where listennummer=:listennummer ";
+                    dbConn.CreateCommand();
+                    dbConn.AddParameter("listennummer", PollexDBType.Varchar, itemNo);
+                    if (string.IsNullOrWhiteSpace(defaultVariant))
+                    {
+                        // Standardvariante ist NULL
+                        sqlCommand += " and varianten is null";
+                    }
+                    else
+                    {
+                        // Standardvariante ist vorhanden
+                        sqlCommand += " and ( varianten like :variante or varianten is null )";
+                        dbConn.AddParameter("variante", PollexDBType.Varchar, "%" + defaultVariant + "%");
+                    }
+
+                    if (dbConn.Exists(sqlCommand))
+                    {
+                        // Für die Standardvariante sind Artikeldefinitionen vorhanden, Baugruppe bleibt eine Baugruppe
+                    }
+                    else
+                    {
+                        // Für die Standardvariante sind keine Artikeldefinitionen vorhanden, Baugruppe wird als Handelsartikel angesehen
+                        sqlCommand = "insert into an_tmp( artikelnummer,inx ) values ( :artikelnummer,:inx )";
+                        dbConn.CreateCommand();
+                        dbConn.AddParameter("artikelnummer", PollexDBType.Varchar, itemNo);
+                        dbConn.AddParameter("inx", PollexDBType.Number, anBgInx.Value);
+                        dbConn.ExecuteCommand(sqlCommand);
+                    }
+                }
+            }
+        }
+        #endregion Vorbereitung der Tabelle AN_TMP für Baugruppen ohne Definition zur Standardvariante des Hauptlieferanten
+
+        dbConn.Commit();
+    }
+    catch
+    {
+        if (dbConn != null && dbConn.Transaction != null)
+            dbConn.Rollback();
+
+        throw;
+    }
+
+    //AL: 01.08.2021 CRM: 123639
+    //Mehrfaches einzelnes Ausführen des Dispo-Managers bei "Dispo-Kennzeichen aus Lager" und mehreren gewählten Quell-Lagern
+    //Normalerweise nur einen Durchlauf durchführen
+    int countCycles = 1;
+    //Die zu durchlaufenden Lager aus dem Request kopieren
+    List<double> stockNumberList = request.StockNumber;
+    //Den Logfile-Namen in eine Variable übernehmen
+    string logFileName = request.LogFileName;
+    if (request.UseStockAvailabiltySign && request.AvailabiltySign.Count > 0 && request.StockNumber.Count > 1)
+    {
+        countCycles = request.StockNumber.Count;
+    }
+
+    //HS: 18.08.2022 CRM: 139050
+    //Für alle übergebenen Lager ein DTO mit deren Eigenschaften erstellen
+    for (int countCycle = 0; countCycle < countCycles; countCycle++)
+    {
+        if (countCycles > 1)
+        {
+            //AL: 01.08.2021 CRM: 123639
+            //Der Dispo-Manager wird mehrfach durchlaufen
+            //Die benötigten Variablen für die Einzelberechnungen setzen
+            //Nur die gerade an der Reihe befindliche Lagernummer durchlaufen
+            stockNumberList = new List<double>();
+            stockNumberList.Add(request.StockNumber[countCycle]);
+            //LogFile je Lager erstellen: _<Lagernummer> an die Profilnummer anhängen
+            //PO 31.08.2021: CRM 132297: Wenn im Dispo Manager nicht "mit Protokolldatei" aktiviert ist dann wird kein Logfilename übergeben
+            if (!string.IsNullOrWhiteSpace(request.LogFileName))
+            {
+                logFileName = request.LogFileName.Replace("_" + request.ProfileNumber, "_" + request.ProfileNumber + "_" + request.StockNumber[countCycle].ToString());
+            }
+        }
+        try
+        {
+            #region Prüfung ob in der Selektion ein Produktionslager vorhanden ist
+            if (stockNumberList != null && stockNumberList.Count > 0)
+            {
+                foreach (var value in stockNumberList)
+                {
+                    if (value == LC.Globals.Constants.SYSTEMSTOCK_PRODUCTION)
+                        isProductionStockInSelection = true;
+                    else
+                    {
+                        sqlCommand = "select produktionslager from filialen where produktionslager=:produktionslager";
+                        dbConn.CreateCommand();
+                        dbConn.AddParameter("produktionslager", PollexDBType.Number, value);
+                        if (dbConn.Exists(sqlCommand))
+                            isProductionStockInSelection = true;
+                    }
+                }
+            }
+            #endregion Prüfung ob in der Selektion ein Produktionslager vorhanden ist
+            #region WhereBedingung erstellen
+            // CreateCommand hier ausführen wegen der Wherebedingungen
+            where = "";
+            dbConn.CreateCommand();
+
+            #region Nur Artikel die nicht in Multikonditionen vewendet werden
+            if (request.ItemsWithoutMultiCondition && anTmpInx.HasValue)
+            {
+                // Alle Artikel aus dem Select auf Artikelstamm ausschliessen welche in der Tabelle AN_TMP sind
+                where += " and not exists ( select '' from an_tmp where an_tmp.artikelnummer=a.artikelnummer and an_tmp.inx=:inx ) ";
+                dbConn.AddParameter("inx", PollexDBType.Number, anTmpInx.Value);
+            }
+            #endregion
+            #region Nur Artikel der ausgewählten Multikondition über die offenen Aufträge der der Multikondition zugeordneten Kunden selektieren
+            else if (!string.IsNullOrWhiteSpace(request.MultiCondition))
+            {
+                //Einschränkung auf Artikel der Multikondition
+                //Selektieren der Konditionseinträge in ein DataSet
+                DataSet dsMulti = dbConn.FillDataSet("select artikelnummer, hauptgruppe, sortiment, gruppe, reihe, hersteller, user1, user2, user3 from ek_kond "
+                                            + " where multikondition='" + request.MultiCondition + "'");
+                if (dsMulti != null && dsMulti.Tables.Count > 0 && dsMulti.Tables[0].Rows.Count > 0)
+                {
+                    int i = 0;
+                    foreach (DataRow row in dsMulti.Tables[0].Rows)
+                    {
+                        if (i == 0)
+                            where += " and ( artikelnummer in ";
+                        else
+                            where += " or artikelnummer in ";
+
+                        where += " ( select artikelnummer from artikelstamm where ";
+
+                        foreach (DataColumn c in dsMulti.Tables[0].Columns)
+                        {
+                            if (row[c].ToString() != "")
+                                where += c.ColumnName + "='" + row[c].ToString() + "' and ";
+                        }
+
+                        //Das letzte "and " mit 1=1 ergänzen
+                        where += " 1=1 ";
+                        where += ")";
+
+                        i++;
+                    }
+
+                    where += " ) ";
+                }
+
+                dbConn.CreateCommand();
+
+
+                where += " and a.artikelnummer in ( select p.artikelnummer from angebote a, angebotspositionen p " +
+                    "where a.nummer=p.nummer and ( p.code=:codeA or ( p.code=:codeP and nvl(p.bg,0)!=:v2) ) " +
+                    "and p.art=:art and a.auftrag=:auftrag and a.erledigt=:erledigt " +
+                    "and a.kundennummer in ( select nummer from kunden where nummer in ( select kundennummer " +
+                    "from ek_zuordnung where typ=:typ and kuerzel=:multikondition ) union select nummer from kunden " +
+                    "where krg in ( select krg from ek_zuordnung where typ=:typ and kuerzel=:multikondition ) ) )";
+                dbConn.AddParameter("codeA", PollexDBType.Varchar, "A");
+                dbConn.AddParameter("codeP", PollexDBType.Varchar, "P");
+                dbConn.AddParameter("v2", PollexDBType.Number, 2);
+                dbConn.AddParameter("art", PollexDBType.Varchar, "M");
+                dbConn.AddParameter("auftrag", PollexDBType.Bool, true);
+                dbConn.AddParameter("erledigt", PollexDBType.Bool, false);
+                dbConn.AddParameter("typ", PollexDBType.Number, 2);
+                dbConn.AddParameter("multikondition", PollexDBType.Varchar, request.MultiCondition);
+
+
+            }
+            #endregion  Nur Artikel der ausgewählten Multikondition über die offenen Aufträge der der Multikondition zugeordneten Kunden selektieren
+            #region Materialbedarf für Projekt aus Kundenauftrag
+            if (request.MaterialRequirement)
+            {
+                where += "and a.artikelnummer in ( select p.artikelnummer from angebotspositionen p where p.tfg=:tfg and p.art=:art " +
+                    " and (( p.code=:codeA and nvl(p.bg,0)=:bg0) or p.code=:codeP ) ";
+                dbConn.AddParameter("tfg", PollexDBType.Bool, true);
+                dbConn.AddParameter("art", PollexDBType.Varchar, "M");
+                dbConn.AddParameter("codeA", PollexDBType.Varchar, "A");
+                dbConn.AddParameter("codeP", PollexDBType.Varchar, "P");
+                dbConn.AddParameter("bg0", PollexDBType.Bool, false);
+
+                int i = 1;
+                where += " and p.lager in ( ";
+                foreach (var value in stockNumberList)
+                {
+                    where += ":lager" + i.ToString() + ", ";
+                    dbConn.AddParameter("lager" + i.ToString(), PollexDBType.Number, value.ParseDouble());
+                    i++;
+                }
+                where = where.Substring(0, where.Length - 2) + " ) ";
+
+                where += " ) ";
+            }
+            #endregion Materialbedarf für Projekt aus Kundenauftrag
+
+            // Lagernummern
+            if (request.CumulateAllStocks && request.StockNumberCumulate.HasValue && !double.IsNaN(request.StockNumberCumulate.Value))
+            {
+                where += " and l.nummer=:nummer ";
+                dbConn.AddParameter("nummer", PollexDBType.Number, request.StockNumberCumulate.Value);
+            }
+            else
+            {
+                if (stockNumberList != null && stockNumberList.Count > 0)
+                {
+                    int i = 1;
+                    where += " and l.nummer in ( ";
+                    foreach (var value in stockNumberList)
+                    {
+                        where += ":nummer" + i.ToString() + ", ";
+                        dbConn.AddParameter("nummer" + i.ToString(), PollexDBType.Number, value.ParseDouble());
+                        i++;
+                    }
+                    where = where.Substring(0, where.Length - 2) + " ) ";
+                }
+            }
+
+            BuildWhereCondition(dbConn, request, stockNumberList, ref where);
+
+            // Mit/Ohne Baugruppen-/Produktionsartikel
+            if (request.AssemblyItems.HasValue)
+            {
+                if (request.AssemblyItems.Value)
+                {
+                    // nur Baugruppen-/Produktionsartikel selektieren
+                    if (request.AssemblyItems.HasValue && request.WithVariantCheck && anBgInx.HasValue)
+                    {
+                        where += " and ( a.bg=:bg or a.produktion=:bg ) and not a.artikelnummer in ( select artikelnummer from an_tmp where inx=:an_tmp_inx ) ";
+                        dbConn.AddParameter("bg", PollexDBType.Bool, true);
+                        dbConn.AddParameter("an_tmp_inx", PollexDBType.Number, anBgInx.Value);
+                    }
+                    else
+                    {
+                        where += " and ( a.bg=:bg or a.produktion=:bg ) ";
+                        dbConn.AddParameter("bg", PollexDBType.Bool, true);
+                    }
+                }
+                else
+                {
+                    // keine Baugruppenartikel selektieren
+                    if (request.AssemblyItems.HasValue && request.WithVariantCheck && anBgInx.HasValue)
+                    {
+                        where += " and ( a.bg=:bg or a.artikelnummer in ( select artikelnummer from an_tmp where inx=:an_tmp_inx ) ) ";
+                        dbConn.AddParameter("bg", PollexDBType.Bool, false);
+                        dbConn.AddParameter("an_tmp_inx", PollexDBType.Number, anBgInx.Value);
+                    }
+                    else
+                    {
+                        //AL: 07.09.2017 CRM: 101346
+                        //Produktionsartikel ebenfalls ausschließen
+                        where += " and a.bg=:bg and a.produktion=:bg ";
+                        dbConn.AddParameter("bg", PollexDBType.Bool, false);
+                    }
+                }
+            }
+
+            // Mit/Ohne Ersatzteilartikel
+            if (request.SpareParts.HasValue)
+            {
+                where += " and a.ersatzteil=:ersatzteil ";
+                dbConn.AddParameter("ersatzteil", PollexDBType.Bool, request.SpareParts.Value);
+            }
+
+            #endregion WhereBedingung erstellen
+            #region DataSet mit den Artikel aus der WhereBedingung erstellen
+            List<DispoManagerItem> dispoItems = new List<DispoManagerItem>();
+            // Join auf Tabelle Lagerbestand wegen der offenen Auftrags- bzw. Bestellmengen soe div. Bestände 
+            // ist nicht möglich, da der Eintrag in Lagerbestand nicht vorhanden sein muss. Daher im Loop ein 
+            // Selekt auf alle zu summierenden Spalten
+            //HS: 22.10.2020 CRM: 124705
+            //Abfrage auf Sammelartikel=0 entfernt
+            sqlCommand = "select l.nummer,a.artikelnummer,a.bezeichnung1,a.bezeichnung2,a.mengeneinheit,nvl(a.bg,0) as bg,nvl(a.gm,0) as gm " +
+                "from artikelstamm a, lager l where a.aktiv=:aktiv and a.artikelart=:artikelart and a.kein_bvo=:kein_bvo " +
+                where + " order by l.nummer,a.artikelnummer";
+            dbConn.AddParameter("aktiv", PollexDBType.Bool, true);
+            dbConn.AddParameter("artikelart", PollexDBType.Varchar, "M");
+            dbConn.AddParameter("kein_bvo", PollexDBType.Bool, false);
+            dsItems = dbConn.FillDataSet(sqlCommand);
+            if (dsItems != null && dsItems.Tables.Count > 0 && dsItems.Tables[0].Rows.Count > 0)
+            {
+                if (polling != null)
+                    polling.SetNextAction("Processing items...", dsItems.Tables[0].Rows.Count);
+
+                //AL: 31.08.2018 CRM: 105537
+                //Aus Performancegründen "Alle Projektlager" nur einmal selektieren und dann die Liste verwenden
+                //Alle aktiven und nicht erledigten Projektlager
+                sqlCommand = "select l.nummer from lager l,projektstamm p where p.projektnummer=l.nummer and l.projektlager=1 and l.aktiv=1 and nvl(p.erledigt,0)=0";
+                allActiveProjectStocks = dbConn.FillListDecimal(sqlCommand);
+
+                foreach (DataRow drItem in dsItems.Tables[0].Rows)
+                {
+                    DispoManagerItem dispoItem = new DispoManagerItem(systemSettings, request, isProductionStockInSelection);
+                    dispoItem.StockNumber = drItem["NUMMER"].ParseDouble();
+                    //dispoItem.Item = LC.LCFunctions.MasterDataFunctions.Items.Select(dbConn, drItem["ARTIKELNUMMER"].ToString(), systemSettings);
+                    //HS: 18.08.2022 CRM: 139050
+                    //Wegen der Hauptlieferantennummer aus den OE-Eigenschaften das Lager und die Lagereinstellungen and die Funktion übertragen
+                    dispoItem.Item = GetItemInfo(dbConn, systemSettings, drItem["ARTIKELNUMMER"].ToString(), dispoItem.StockNumber.ParseLong(), stockSettings, request);
+
+                    //AL: 16.09.2014
+                    //Wenn "Item" nicht selektiert werden kann, führt dies zu einem "Object reference" Fehler - daher wird dies nun abgefangen
+                    if (dispoItem.Item == null)
+                        throw new Exception("Error processing item: " + drItem["ARTIKELNUMMER"].ToString() + "\nError at GetItemInfo()\nItem or item supplier data does not exists!");
+
+                    if (polling != null)
+                    {
+                        polling.SetAsyncInfo("Item " + dispoItem.Item.sArtikelnummer + " in progress...");
+                        polling.IncCurrentCount();
+                    }
+
+                    #region Tabelle Lagerbestand einlesen
+                    dbConn.CreateCommand();
+                    sqlCommand = "select sum(nvl(b.bestand,0)) as bestand,sum(nvl(b.off_auf,0)) as off_auf,sum(nvl(b.off_bes,0)) as off_bes," +
+                        "sum(nvl(b.verbrauch,0)) as verbrauch,sum(nvl(b.off_plan,0)) as off_plan,sum(nvl(b.off_rahmen,0)) as off_rahmen," +
+                        "sum(nvl(b.mindestbestand,0)) as mindestbestand,sum(nvl(b.mind_rahmen_menge,0)) as mind_rahmen_menge," +
+                        "sum(nvl(b.maximalbestand,0)) as maximalbestand,sum(nvl(b.meldebestand,0)) as meldebestand," +
+                        "sum(nvl(b.sicherheitsbestand,0)) as sicherheitsbestand, b.lager from lagerbestand b where b.artnr=:artnr ";
+                    if (request.CumulateAllStocks)
+                    {
+                        if (stockNumberList != null && stockNumberList.Count > 0)
+                        {
+                            int i = 1;
+                            sqlCommand += " and b.lager in ( ";
+                            foreach (var value in stockNumberList)
+                            {
+                                sqlCommand += ":lager" + i.ToString() + ", ";
+                                dbConn.AddParameter("lager" + i.ToString(), PollexDBType.Number, value.ParseDouble());
+                                i++;
+                            }
+                            sqlCommand = sqlCommand.Substring(0, sqlCommand.Length - 2) + " ) ";
+                        }
+                    }
+                    else
+                    {
+                        sqlCommand += " and b.lager=:lager ";
+                        dbConn.AddParameter("lager", PollexDBType.Number, dispoItem.StockNumber);
+                    }
+                    sqlCommand += " group by b.lager";
+                    dbConn.AddParameter("artnr", PollexDBType.Varchar, dispoItem.Item.sArtikelnummer);
+                    dsTemp = dbConn.FillDataSet(sqlCommand);
+                    if (dsTemp != null && dsTemp.Tables.Count > 0 && dsTemp.Tables[0].Rows.Count > 0)
+                    {
+                        foreach (DataRow drTemp in dsTemp.Tables[0].Rows)
+                        {
+                            StockInfo stockInfo = new StockInfo(request);
+                            stockInfo.Lager = drTemp["LAGER"].ParseDouble();
+                            stockInfo.Mindestbestand = drTemp["MINDESTBESTAND"].ParseDoubleNvl();
+                            stockInfo.MindestRahmenmenge = drTemp["MIND_RAHMEN_MENGE"].ParseDoubleNvl();
+                            stockInfo.Maximalbestand = drTemp["MAXIMALBESTAND"].ParseDoubleNvl();
+                            stockInfo.Meldebestand = drTemp["MELDEBESTAND"].ParseDoubleNvl();
+                            stockInfo.LinearerVerbrauch = drTemp["VERBRAUCH"].ParseDoubleNvl();
+                            stockInfo.Sicherheitsbestand = drTemp["SICHERHEITSBESTAND"].ParseDoubleNvl();
+
+                            stockInfo.OffeneAuftragsmengeLB = drTemp["OFF_AUF"].ParseDoubleNvl();
+                            stockInfo.OffeneRahmenAuftragsmengeLB = drTemp["OFF_RAHMEN"].ParseDoubleNvl();
+                            stockInfo.OffenePlanAuftragsmengeLB = drTemp["OFF_PLAN"].ParseDoubleNvl();
+                            stockInfo.OffeneBestellmengeLB = drTemp["OFF_BES"].ParseDoubleNvl();
+
+                            #region mit Lagerbestand
+                            if (request.WithStockQuantities)
+                            {
+                                stockInfo.Bestand += drTemp["BESTAND"].ParseDouble();
+                                //dispoItem.StockQuantity += drTemp["BESTAND"].ParseDouble();
+                                //dispoItem.TotalStockQuantity = dispoItem.StockQuantity;
+
+                                //if (drTemp["BESTAND"].ParseDoubleNvl() != 0)
+                                //    dispoItem.StockQuantities.Add(drTemp["LAGER"].ParseDouble(), drTemp["BESTAND"].ParseDouble());
+                            }
+                            #endregion mit Lagerbestand
+                            #region mit offener Auftragsmenge
+                            if (request.WithOpenOrders)
+                            {
+                                //AL: 31.08.2018 CRM: 105177
+                                //Ist der Haken "mit Summe aller Projektlager" aktiviert, müssen auch bei den offenen 
+                                //Aufträgen alle Projektlager berücksichtigt werden
+                                // Temporäre double List erstellen für Funktionsaufruf
+                                List<double> tempStocks = new List<double>();
+
+                                //AL: 23.07.2019 CRM: 115815
+                                //Wenn "mit Summe aller Projektlager" aktiviert ist, dann werden diese offenen Auftragsmengen nur einmal selektiert
+                                //und zwar für das erste Lager des Artikels in der Liste
+                                //Sonst werden die Einträge in die Tabelle BESTELLVORSCHLAG danach je gewähltem Lager dupliziert
+                                if (request.WithAllProjectStocks && !processedItemsFirstStock.Contains(dispoItem.Item.sArtikelnummer))
+                                {
+                                    #region Aufträge für selektierte Lager und alle Projektlager
+                                    //Alle im Profil selektierten Lager
+                                    tempStocks.Add(drTemp["LAGER"].ParseDouble());
+
+                                    if (allActiveProjectStocks != null)
+                                    {
+                                        foreach (decimal? projStock in allActiveProjectStocks)
+                                        {
+                                            if (projStock.HasValue)
+                                                tempStocks.Add(projStock.ParseDouble());
+                                        }
+                                    }
+                                    #endregion
+                                }
+                                else if (
+                                        stockInfo.OffeneAuftragsmengeLB > 0
+                                        ||
+                                        (stockInfo.OffenePlanAuftragsmengeLB > 0 && request.WithPlannedOrders)
+                                        ||
+                                        (stockInfo.OffeneRahmenAuftragsmengeLB > 0 && request.WithFrameOrders)
+                                        ||
+                                        request.NegativOrderQuantity)
+                                {
+                                    //Alle im Profil selektierten Lager
+                                    tempStocks.Add(drTemp["LAGER"].ParseDouble());
+                                }
+
+                                if (tempStocks.Count > 0)
+                                {
+                                    // offene Aufträge
+                                    List<OpenOrderQuantity> openOrderQuantities =
+                                        GetOpenOrderQuantities(dbConn, OpenOrderQuantityOrderType.Order, dispoItem.Item.sArtikelnummer,
+                                            tempStocks, request);
+                                    if (openOrderQuantities != null)
+                                    {
+                                        stockInfo.OpenOrderQuantities = openOrderQuantities;
+                                    }
+
+                                    // mit offenen Rahmenaufträgen
+                                    if (request.WithFrameOrders && stockInfo.OffeneRahmenAuftragsmengeLB > 0)
+                                    {
+                                        List<OpenOrderQuantity> openFrameOrderQuantities =
+                                            GetOpenOrderQuantities(dbConn, OpenOrderQuantityOrderType.FrameOrder, dispoItem.Item.sArtikelnummer,
+                                                tempStocks, request);
+                                        if (openFrameOrderQuantities != null)
+                                        {
+                                            stockInfo.OpenFrameOrderQuantities = openFrameOrderQuantities;
+                                        }
+                                    }
+
+                                    // mit offenen Planaufträgen
+                                    if (request.WithPlannedOrders && stockInfo.OffenePlanAuftragsmengeLB > 0)
+                                    {
+                                        List<OpenOrderQuantity> openPlannedOrderQuantities =
+                                            GetOpenOrderQuantities(dbConn, OpenOrderQuantityOrderType.PlannedOrder, dispoItem.Item.sArtikelnummer,
+                                                tempStocks, request);
+                                        if (openPlannedOrderQuantities != null)
+                                        {
+                                            stockInfo.OpenPlannedOrderQuantities = openPlannedOrderQuantities;
+                                        }
+                                    }
+                                }
+                            }
+
+                            #endregion mit offener Auftragsmenge
+                            #region mit offener Bestellmenge
+                            if (request.WithOpenPurchaseOrders)
+                            {
+                                //AL: 31.08.2018 CRM: 105177
+                                //Ist der Haken "mit Summe aller Projektlager" aktiviert, müssen auch bei den offenen 
+                                //Aufträgen alle Projektlager berücksichtigt werden
+                                // Temporäre double List erstellen für Funktionsaufruf
+                                List<double> tempStocks = new List<double>();
+
+                                if (request.WithAllProjectStocks)
+                                {
+                                    #region Aufträge für selektierte Lager und alle Projektlager
+                                    //Alle im Profil selektierten Lager
+                                    tempStocks.Add(drTemp["LAGER"].ParseDouble());
+
+                                    if (allActiveProjectStocks != null)
+                                    {
+                                        foreach (decimal? projStock in allActiveProjectStocks)
+                                        {
+                                            if (projStock.HasValue)
+                                                tempStocks.Add(projStock.ParseDouble());
+                                        }
+                                    }
+                                    #endregion
+                                }
+                                else if (stockInfo.OffeneBestellmengeLB > 0 || request.WithFramePurchaseOrders)
+                                {
+                                    //Alle im Profil selektierten Lager
+                                    tempStocks.Add(drTemp["LAGER"].ParseDouble());
+                                }
+
+                                if (tempStocks.Count > 0)
+                                {
+                                    // offene Bestellungen
+                                    List<OpenPurchaseOrderQuantity> openPurchaseOrderQuantities =
+                                        GetOpenPurchaseOrderQuantities(dbConn, systemSettings, dispoItem.Item.sArtikelnummer, tempStocks,
+                                            request.PurchaseOrderDateFrom, request.PurchaseOrderDateTo, request.WithFramePurchaseOrders, request.IgnoreDeliverydateOKFrom, request.IgnoreDeliverydateOKTo);
+                                    if (openPurchaseOrderQuantities != null)
+                                    {
+                                        stockInfo.OpenPurchaseOrderQuantities = openPurchaseOrderQuantities;
+                                    }
+                                }
+                            }
+
+                            #endregion mit offener Bestellmenge
+                            #region mit offener Wareneingangsmenge
+                            if (!systemSettings.PurchaseOrders.GelieferteMengeSofortAktualisieren)
+                            {
+                                // offene Eingangslieferscheine
+                                List<OpenGoodsReceiptQuantity> openGoodsReceiptQuantities =
+                                    GetOpenGoodsReceiptQuantities(dbConn, systemSettings, dispoItem.Item.sArtikelnummer, drTemp["LAGER"].ParseLong());
+                                if (openGoodsReceiptQuantities != null)
+                                {
+                                    stockInfo.OpenGoodsReceiptQuantities = openGoodsReceiptQuantities;
+                                }
+                            }
+                            #endregion mit offener Wareneingangsmenge
+                            #region mit offenen Umbuchungen
+                            if (request.WithOpenStockTransfers)
+                            {
+                                // HS 03.10.2018 CRM 110035
+                                // Zubuchungslager und Abbuchungslager muß geprüft werden
+
+                                // Zubuchungen einlesen
+                                List<OpenStockTransfer> openInStockTransfer =
+                                    GetOpenStockTransfers(dbConn, TransferType.Posting, dispoItem.Item.sArtikelnummer, drTemp["LAGER"].ParseDouble());
+                                if (openInStockTransfer != null)
+                                {
+                                    stockInfo.OpenInStockTransfers = openInStockTransfer;
+                                }
+
+                                // Abbuchungen einlesen
+                                List<OpenStockTransfer> openOutStockTransfer =
+                                    GetOpenStockTransfers(dbConn, TransferType.Withdrawal, dispoItem.Item.sArtikelnummer, drTemp["LAGER"].ParseDouble());
+                                if (openOutStockTransfer != null)
+                                {
+                                    stockInfo.OpenOutStockTransfers = openOutStockTransfer;
+                                }
+                            }
+                            #endregion mit offenen Umbuchungen
+
+                            #region Baugruppenbedarf für Kundenauftrag behandeln
+                            // SCH 08.02.2015 (Projekt ROLF) Baugruppenbedarf aus Kundenauftrag immer mit Kundenauftrag. 
+                            // Wenn ein FA vorhanden ist, dann die gelieferte Menge erhöhen. Somit wird kein BVO erstellt.
+                            // Einlesen nur dann wenn mit Lagerbestand und mit offenen Bestellungen aktiviert ist
+                            if (dispoItem.Item.bIstBaugruppe && request.AssemblyRequirementFromOrders && request.WithStockQuantities && request.WithOpenPurchaseOrders)
+                            {
+                                // Wenn für eine Baugruppe der Code=P BG=2 bereits ein Fertigungsauftrag besteht, darf die offene Kundenauftragsmenge
+                                // im Bestellvorschlag sich nicht auswirken. Daher die NOT EXISTS Klausel. Weiters kann der Fertigungsauftrag in dem
+                                // sich die Code=P BG=2 Zeile als Bauteil befindet bereits produziert und fertig sein. Dadurch wird aber keine
+                                // zusätzliche INformation in die Auftragsposition geschrieben. D.h., durch die Produktion der Überbaugruppe ändert
+                                // sich nicht im Kundenauftrag
+
+                                List<OpenOrderQuantity> openOrderQuantities =
+                                    GetOpenOrderQuantities(dbConn, dispoItem.Item.sArtikelnummer, drTemp["LAGER"].ParseDouble(), request);
+                                if (openOrderQuantities != null && openOrderQuantities.Count > 0)
+                                {
+                                    if (stockInfo.OpenOrderQuantities == null)
+                                        stockInfo.OpenOrderQuantities = new List<OpenOrderQuantity>();
+
+                                    foreach (OpenOrderQuantity ooq in openOrderQuantities)
+                                        stockInfo.OpenOrderQuantities.Add(ooq);
+                                }
+                            }
+                            #endregion Baugruppenbedarf für Kundenauftrag behandeln
+
+                            #region Reichweiten behandeln
+                            if (request.InclusionTypes[0] == ExecuteDispoManagerInclusionEnum.DisponibelKleinerReichweite)
+                            {
+                                RangeInfo range = GetRangeInfo(dbConn, systemSettings, dispoItem.Item, stockInfo.Lager);
+                                if (range == null)
+                                    throw new Exception("Error on GetRangeInfo()");
+                                if (range != null)
+                                    stockInfo.RangeInfo = range;
+                            }
+                            #endregion Reichweiten behandeln
+
+                            dispoItem.StockInfo.Add(stockInfo);
+
+                            if (!processedItemsFirstStock.Contains(dispoItem.Item.sArtikelnummer))
+                                processedItemsFirstStock.Add(dispoItem.Item.sArtikelnummer);
+                        }
+                    }
+                    #endregion Tabelle Lagerbestand einlesen
+                    #region Projektlager einlesen
+                    if (request.WithAllProjectStocks)
+                    {
+                        dispoItem.ProjectStockInfo = GetProjectStockQuantity(dbConn, dispoItem.Item.sArtikelnummer);
+                    }
+                    #endregion Projektlager einlesen
+                    #region mit offenen Fertigungsaufträgen
+                    if (request.WithOpenAssemblyOrders)
+                    {
+                        //AL: 20.10.2020 CRM: 119047
+                        //Umbau der Lagerermittlung, so dass auch "mit Summe der Produktionslager" berücksichtigt wird
+                        List<double> tempStocks = new List<double>();
+
+                        if (request.WithAllProjectStocks)
+                        {
+                            //AL: 07.03.2018 CRM: 105177
+                            //Ist der Haken "mit Summe aller Projektlager" aktiviert, müssen auch bei den offenen 
+                            //Fertigungsaufträgen alle Projektlager berücksichtigt werden
+                            tempStocks.AddRange(stockNumberList);
+                            if (allActiveProjectStocks != null)
+                            {
+                                foreach (decimal? projStock in allActiveProjectStocks)
+                                {
+                                    if (projStock.HasValue)
+                                        tempStocks.Add(projStock.ParseDouble());
+                                }
+                            }
+                        }
+
+                        if (request.WithSumProductionsStocks)
+                        {
+                            //Alle Produktionslager (der gewählten OE) hinzufügen
+                            List<long> productionStocks = LC.LCFunctions.AdditionalPrograms.Production.Stocks.GetProductionStockList(dbConn, request.OrganisationUnits);
+                            if (productionStocks != null)
+                            {
+                                foreach (long productionStock in productionStocks)
+                                {
+                                    if (!tempStocks.Contains(productionStock))
+                                        tempStocks.Add(productionStock);
+                                }
+                            }
+                        }
+
+                        if (request.SelectedStockNumber && stockNumberList.Count > 1)
+                        {
+                            //Fertigungsaufträge nur für das selektierte Lager berücksichtigen
+                            if (!tempStocks.Contains(dispoItem.StockNumber))
+                                tempStocks.Add(dispoItem.StockNumber);
+                        }
+                        else
+                        {
+                            //Fertigungsaufträge aller selektierten Lager berücksichtigen
+                            foreach (double stockNo in stockNumberList)
+                            {
+                                if (!tempStocks.Contains(stockNo))
+                                    tempStocks.Add(stockNo);
+                            }
+                        }
+
+                        List<OpenAssemblyOrderQuantity> openAssemblyOrderQuantities =
+                                GetOpenAssemblyOrderQuantities(dbConn, dispoItem.Item.sArtikelnummer, tempStocks, request);
+                        if (openAssemblyOrderQuantities != null)
+                        {
+                            dispoItem.OpenAssemblyOrderQuantities = openAssemblyOrderQuantities;
+                        }
+
+                        if (dispoItem.Item.bIstBaugruppe && (request.AssemblyRequirementFromAssemblyOrders ||
+                                request.AssemblyRequirementFromLinConsumption || request.AssemblyRequirementFromOrders))
+                        {
+                            // Artikel ist eine Baugruppe wird nur für Baugruppenbedarfe benötigt
+                            List<OpenAssemblyOrder> openAssemblyOrders =
+                                GetOpenAssemblyOrders(dbConn, dispoItem.Item.sArtikelnummer, request);
+                            if (openAssemblyOrders != null)
+                            {
+                                dispoItem.OpenAssemblyOrders = openAssemblyOrders;
+                            }
+                        }
+                    }
+                    #endregion mit offenen Fertigungsaufträgen
+                    #region Fremdfertigungaufträge behandeln
+                    if (request.WithOpenAssemblyOrders)     // HS 04.05.2015 CRM 81120. "|| request.AssemblyRequirementFromOrders || request.AssemblyRequirementFromAssemblyOrders" entfernt
+                    {
+                        // Lagerbestände der Fremdfertigungsläger berücksichtigen
+                        List<StockInfo> foreignStockInfos = GetForeignStockQuantity(dbConn, systemSettings, dispoItem.Item.sArtikelnummer, request.OrganisationUnits,
+                            stockNumberList, request.AssemblyOrderStartDateFrom, request.AssemblyOrderStartDateTo, request);
+                        if (foreignStockInfos != null)
+                        {
+                            // Prüfung ob die Lagerstand Info Klasse null ist
+                            if (dispoItem.StockInfo == null)
+                                dispoItem.StockInfo = new List<StockInfo>();
+
+                            // Alle Lagerinformationen aus der Fremdfertigungs Lagerbestands Info Klasse in die Lagerstand Info Klasse übernehmen
+                            foreach (StockInfo si in foreignStockInfos)
+                                dispoItem.StockInfo.Add(si);
+                        }
+                    }
+                    #endregion Fremdfertigungaufträge behandeln
+                    #region Baugruppenbedarf für Kunden-/Fertigungsauftrag behandeln
+                    // SCH 08.02.2015 (Projekt ROLF) Baugruppenbedarf aus Kundenauftrag immer mit Kundenauftrag. 
+                    // Wenn ein FA vorhanden ist, dann die gelieferte Menge erhöhen. Somit wird kein BVO erstellt.
+                    // Einlesen nur dann wenn mit Lagerbestand und mit offenen Bestellungen aktiviert ist
+                    //if ((request.AssemblyRequirementFromOrders || request.AssemblyRequirementFromAssemblyOrders)
+                    //    && request.WithStockQuantities && request.WithOpenPurchaseOrders)
+                    //AL: 09.01.2017 CRM: 86608
+                    //Dieser Bereich überschreibt die bereits ermittelten offenen FA-Mengen eines Artikels nochmals
+                    //Insbesondere werden die "offenen FA-Positionen" überschrieben und dabei nur EIN Lager berücksichtigt (dispoItem.StockNumber)
+                    //Daher gehen Bedarfe über verschiedene Lager hinweg verloren
+                    //Besprechung mit HS erforderlich, einstweilen auf den Schalter "Ausgewählte Lager kumulieren" gehängt
+                    if (!request.CumulateAllStocks)
+                    {
+                        if (dispoItem.Item.bIstBaugruppe && request.WithOpenAssemblyOrders)
+                        {
+                            // Artikel ist eine Baugruppe wird nur für Baugruppenbedarfe benötigt
+                            List<OpenAssemblyOrder> openAssemblyOrders =
+                                GetOpenAssemblyOrders(dbConn, dispoItem.Item.sArtikelnummer, request);
+                            if (openAssemblyOrders != null)
+                            {
+                                dispoItem.OpenAssemblyOrders = openAssemblyOrders;
+                            }
+
+                            // Temporäre double List erstellen für Funktionsaufruf
+                            List<double> tempStocks = new List<double>();
+                            tempStocks.Add(dispoItem.StockNumber);
+
+                            List<OpenAssemblyOrderQuantity> openAssemblyOrderQuantities =
+                                GetOpenAssemblyOrderQuantities(dbConn, dispoItem.Item.sArtikelnummer, tempStocks, request);
+                            if (openAssemblyOrderQuantities != null)
+                            {
+                                dispoItem.OpenAssemblyOrderQuantities = openAssemblyOrderQuantities;
+                            }
+                        }
+                    }
+                    #endregion Baugruppenbedarf für Kunden-/Fertigungsauftrag behandeln
+                    #region Bedarf durch andere Lager decken
+                    if (request.CalculationTypes[0] == ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken)
+                    {
+                        dispoItem.TransferFromStocks = GetTransferFromStockInfo(dbConn, dispoItem.Item.sArtikelnummer, request.OtherStockNumber, request.AvailabiltySignCoverage);
+                    }
+                    #endregion Bedarf durch andere Lager decken
+                    // HS 10.05.2019 CRM 109990
+                    // Prüfung auf Artikel in Projektlagerumbuchungsvorschlag
+                    if (request.WithoutOpenProjectStockTransfers)
+                    {
+                        dispoItem.OpenProjectStockTransfers = GetOpenProjectStockTransfers(dbConn, dispoItem.Item.sArtikelnummer);
+                    }
+
+                    // Aufnahme in Bestellvorschlag
+                    foreach (var inclusionType in request.InclusionTypes)
+                    {
+                        switch (inclusionType)
+                        {
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleinerLinVerbrauch:
+                                if (dispoItem.DisponibleQuantity < dispoItem.TotalLinearConsumptionQuantity)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleinerMeldebestand:
+                                if (dispoItem.DisponibleQuantity < dispoItem.MessageStockLevel)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleinerMindestbestand:
+                                if (dispoItem.DisponibleQuantity < dispoItem.MinimumStockLevel)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleinerMindestRahmenmenge:
+                                if (dispoItem.DisponibleQuantity < dispoItem.MinimumFrameQuantity)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleinerReichweite:
+                                if (dispoItem.DisponibleQuantity < dispoItem.RangeRequirement)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.DisponibelKleiner0:
+                                if (dispoItem.DisponibleQuantity < 0)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.OhneVerfuegbarkeitspruefung:
+                                dispoItem.UsedInclusionType = inclusionType;
+                                dispoItem.OK = true;
+                                break;
+
+                            case ExecuteDispoManagerInclusionEnum.ArtikelMitNullEinfuegen:
+                                dispoItem.UsedInclusionType = inclusionType;
+                                dispoItem.OK = true;
+                                break;
+
+                            // AR 22.12.2022 CRM 139090
+                            case ExecuteDispoManagerInclusionEnum.VerfuegbarKleiner0:
+                                if (dispoItem.AvailableQuantity < 0)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+                            case ExecuteDispoManagerInclusionEnum.VerfuegbarKleinerMindestbestand:
+                                if (dispoItem.AvailableQuantity < dispoItem.MinimumStockLevel)
+                                {
+                                    dispoItem.UsedInclusionType = inclusionType;
+                                    dispoItem.OK = true;
+                                }
+                                break;
+                        }
+                    }
+
+                    // Wenn Bedarf durch andere Lager decken aktiviert ist, wird die Zeile in Bestellvorschlag nur dann erstellt, 
+                    // wenn eine disponible Menge < 0 errechnet wurde.
+                    //AL: 29.09.2020
+                    //Es wurde nur auf "CalculationTypes[0]" abgefragt - es muss durch alle Types durchgelaufen werden
+                    foreach (var calculationType in request.CalculationTypes)
+                    {
+                        switch (calculationType)
+                        {
+                            case ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken:
+                                if (dispoItem.DisponibleQuantity > 0)
+                                    dispoItem.OK = false;
+                                break;
+                        }
+                    }
+
+                    // Auffüllung auf ...
+                    // nur wenn dispoItem.OK auf true steht, ansonsten ist ausreichender disponibler Bestand vorhanden.
+                    if (dispoItem.OK)
+                    {
+                        bool fillToLinearConsumptionActivated = false;
+                        bool fillToRangeConsumptionActivated = false;
+
+                        foreach (var calculationType in request.CalculationTypes)
+                        {
+                            switch (calculationType)
+                            {
+                                case ExecuteDispoManagerCalculateEnum.AuffuellungAufLinVerbrauch:
+                                    //AL: 24.09.2020 CRM: 124775
+                                    //Wenn eine Anzahl Wochen für die Auffüllung auf linearen Verbrauch angegeben wurde,
+                                    //dann werden diese Wochen zwingend berücksichtigt
+                                    if (request.WeeksForLinearConsumption.HasValue && !double.IsNaN(request.WeeksForLinearConsumption.Value))
+                                    {
+                                        //Auffüllung erfolgt über die angegebenen Wochen
+                                        fillToLinearConsumptionActivated = true;
+                                    }
+                                    else
+                                    {
+                                        if ((dispoItem.TotalLinearConsumptionQuantity - dispoItem.DisponibleQuantity) > dispoItem.ProposalQuantity)
+                                        {
+                                            dispoItem.ProposalQuantity = dispoItem.TotalLinearConsumptionQuantity - dispoItem.DisponibleQuantity;
+                                            dispoItem.UsedCalculationType = calculationType;
+                                            fillToLinearConsumptionActivated = true;
+                                        }
+                                    }
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.AuffuellungAufMindestbestand:
+                                    if ((dispoItem.MinimumStockLevel - dispoItem.DisponibleQuantity) > dispoItem.ProposalQuantity)
+                                    {
+                                        dispoItem.ProposalQuantity = dispoItem.MinimumStockLevel - dispoItem.DisponibleQuantity;
+                                        dispoItem.UsedCalculationType = calculationType;
+                                    }
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.AuffuellungAufMaximalbestand:
+                                    if ((dispoItem.MaximumStockLevel - dispoItem.DisponibleQuantity) > dispoItem.ProposalQuantity)
+                                    {
+                                        dispoItem.ProposalQuantity = dispoItem.MaximumStockLevel - dispoItem.DisponibleQuantity;
+                                        dispoItem.UsedCalculationType = calculationType;
+                                    }
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.AuffuellungAufMeldebestand:
+                                    if ((dispoItem.MessageStockLevel - dispoItem.DisponibleQuantity) > dispoItem.ProposalQuantity)
+                                    {
+                                        dispoItem.ProposalQuantity = dispoItem.MessageStockLevel - dispoItem.DisponibleQuantity;
+                                        dispoItem.UsedCalculationType = calculationType;
+                                    }
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.AuffuellungAufReichweite:
+                                    dispoItem.ProposalQuantity = dispoItem.UpToRangeQuantity - dispoItem.DisponibleQuantity;
+                                    dispoItem.UsedCalculationType = calculationType;
+                                    fillToRangeConsumptionActivated = true;
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.KeineAuffuellung:
+                                    //AL: 29.09.2020 CRM: 124836
+                                    //Bei "Keine Auffüllung" darf nur auf "0" aufgefüllt werden, wenn der disponible Bestand negativ ist
+                                    if (dispoItem.DisponibleQuantity < 0)
+                                    {
+                                        dispoItem.ProposalQuantity = Math.Abs(dispoItem.DisponibleQuantity);
+                                        //dispoItem.ProposalQuantity = 0;  // HS 31.07.2014; Vorgang 73029
+                                        dispoItem.UsedCalculationType = calculationType;
+                                    }
+                                    break;
+
+                                case ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken:
+                                    dispoItem.ProposalQuantity = Math.Abs(dispoItem.DisponibleQuantity);
+                                    dispoItem.UsedCalculationType = calculationType;
+                                    break;
+                            }
+
+                        }
+
+                        //AL: 15.09.2020 CRM: 124488
+                        //Bedarf für X Wochen nach Ermittlung der größten Auffülloption prüfen
+                        if (request.WeeksForLinearConsumption.HasValue && !double.IsNaN(request.WeeksForLinearConsumption.Value))
+                        {
+                            // Bedarf = Monatsverbrauch durch vier multipliziert mit der Anzahl Wochen.
+                            //dispoItem.ProposalQuantity = dispoItem.LinearConsumptionQuantity / 4 * request.WeeksForLinearConsumption.Value;
+
+                            // HS 30.09.2016 CRM: 93132                            
+                            //dispoItem.ProposalQuantity = (dispoItem.LinearConsumptionQuantity / 4 * request.WeeksForLinearConsumption.Value) - dispoItem.DisponibleQuantity;
+
+                            double weeksForLinearConsumptionProposalQuantity = (dispoItem.LinearConsumptionQuantity / 4 * request.WeeksForLinearConsumption.Value) - dispoItem.DisponibleQuantity;
+                            //Wenn die Vorschlagsmenge aus linearem Verbrauch größer ist als die aktuelle Vorschlagsmenge, dann diese verwenden
+                            if (weeksForLinearConsumptionProposalQuantity > dispoItem.ProposalQuantity)
+                            {
+                                dispoItem.ProposalQuantity = weeksForLinearConsumptionProposalQuantity;
+                                dispoItem.UsedCalculationType = ExecuteDispoManagerCalculateEnum.AuffuellungAufLinVerbrauch;
+                            }
+                        }
+
+                        //AL: 15.09.2020 CRM: 124488
+                        //Die Vorschlagsmenge darf niemals größer als der Maximalbestand abzüglich der disponiblen Menge eines Artikels sein
+                        //Ausser, es handelt sich um eine Auffüllung auf linearen Verbrauch, dann kann die Vorschlagsmenge auch größer als der Maximalbestand sein
+                        //AL: 18.01.2021 CRM: 135069 - auch bei Auffüllung auf Reichweiten den Maximalbestand am Lager ignorieren
+                        if (!fillToLinearConsumptionActivated && !fillToRangeConsumptionActivated)
+                        {
+                            if (dispoItem.MaximumStockLevel > 0 && dispoItem.ProposalQuantity > (dispoItem.MaximumStockLevel - dispoItem.DisponibleQuantity))
+                                dispoItem.ProposalQuantity = (dispoItem.MaximumStockLevel - dispoItem.DisponibleQuantity);
+                        }
+
+                        // Wenn Aufgrund der Berechnung zur Auffüllung eine Minusmenge sich ergibt, die Menge auf 0,00 setzen
+                        if (dispoItem.ProposalQuantity < 0)
+                            dispoItem.ProposalQuantity = 0;
+
+                        // HS 13.05.2019 CRM 109990
+                        // Wenn offenen Projektumbuchungsvoschläge vorhanden sind, ist die Bestellvorschlagsmenge 0
+                        if (dispoItem.OpenProjektStockTransferQuantity > 0)
+                            dispoItem.ProposalQuantity = 0;
+
+                        // Mindestbestellmenge prüfen.
+                        // Nur wenn eine Bestellmenge vorhanden ist. Ansonsten würde bei Menge 0 immer die Mindest Bestellmenge eingefügt werden
+                        // HS 24.09.2015: Erhöhung auf Mindestbestellmenge bei Bedarf durch andere Lagerdecken nicht ausführen
+                        // HS 09.04.2018: CRM 106251
+                        // Die Mindestbestellmenge aus ALIEF ist in EK Mengeneinheit. Faktor berücksichtigen
+                        if (dispoItem.ProposalQuantity > 0 && !double.IsNaN(dispoItem.Item.MindestBestellmenge) && dispoItem.Item.MindestBestellmenge > dispoItem.ProposalQuantity
+                            && request.CalculationTypes[0] != ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken)
+                        {
+                            dispoItem.ProposalQuantityBeforeIncreaseUpToMinOQ = dispoItem.ProposalQuantity;
+                            dispoItem.ProposalQuantity = dispoItem.Item.MindestBestellmenge;
+                            dispoItem.IsIncreasedUpToMinimumOrderQuantity = true;
+                        }
+
+                        // HS: 17.11.2020: CRM 125715
+                        // Bestellvorschlagsmenge prüfen.
+                        if (dispoItem.ProposalQuantity > 0 && dispoItem.Item.BestellvorschlagsMenge.HasValue && dispoItem.Item.BestellvorschlagsMenge.Value > dispoItem.ProposalQuantity.ParseDecimalNvl()
+                            && request.CalculationTypes[0] != ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken)
+                        {
+                            dispoItem.ProposalQuantityBeforeIncreaseUpToOptOQ = dispoItem.ProposalQuantity;
+                            dispoItem.ProposalQuantity = dispoItem.Item.BestellvorschlagsMenge.ParseDoubleNvl();
+                            dispoItem.IsIncreasedUpToOptimalOrderQuantity = true;
+                        }
+
+                        // auf Ganze Mengeneinheit aufrunden
+                        if (dispoItem.Item.bGanzeMengeneinheit)
+                        {
+                            // Abweichende EK Mengeneinheit ?
+                            if (dispoItem.Item.nFaktor_GanzeMEH != 1)
+                            {
+                                double purchaseQuantity = dispoItem.ProposalQuantity / dispoItem.Item.nFaktor_GanzeMEH;
+                                // Prüfung ob die Bestellvorschlagsmenge in Einkaufsmengeneinheit der ganzen Mengeneinheit entspricht
+                                if (purchaseQuantity != Math.Ceiling(purchaseQuantity))
+                                {
+                                    // Aufrundung durchführen
+                                    purchaseQuantity = Math.Ceiling(purchaseQuantity);
+                                    dispoItem.ProposalQuantity = purchaseQuantity * dispoItem.Item.nFaktor_GanzeMEH;
+                                    dispoItem.IsRoundedUpToWholeUnit = true;
+                                }
+                            }
+                            else
+                            {
+                                // Prüfung ob die Bestellvorschlagsmenge der ganzen Mengeneinheit entspricht
+                                if (dispoItem.ProposalQuantity != Math.Ceiling(dispoItem.ProposalQuantity))
+                                {
+                                    // Aufrundung durchführen
+                                    dispoItem.ProposalQuantity = Math.Ceiling(dispoItem.ProposalQuantity);
+                                    dispoItem.IsRoundedUpToWholeUnit = true;
+                                }
+                            }
+                        }
+
+                        //AL: 25.05.2017 CRM: 99225
+                        //Bevor der Artikel in den BVO eingefügt werden kann, muss geprüft werden, ob dieser bereits in anderen BVOs vorkommt
+                        //Ist im anderen BVO "BES_OK" (Bestellfreigabe) aktiviert, so verbleibt der Artikel im anderen BVO und wird aus diesem entfernt
+                        //Ist "BES_OK" nicht gesetzt, wird der Artikel aus dem anderen BVO gelöscht und verbleibt in diesem BVO
+                        sqlCommand = "select '' from bestellvorschlag where profil<>:profil and artikelnummer=:artikelnummer and lager=:lager "
+                                    + " and beposinx is null and fainx is null and bes_ok=:v1";
+                        dbConn.CreateCommand();
+                        dbConn.AddParameter("profil", PollexDBType.Number, request.ProfileNumber);
+                        dbConn.AddParameter("artikelnummer", PollexDBType.Varchar, dispoItem.Item.sArtikelnummer);
+                        dbConn.AddParameter("lager", PollexDBType.Number, dispoItem.StockNumber);
+                        dbConn.AddParameter("v1", PollexDBType.SmallInt, 1);
+                        if (dbConn.Exists(sqlCommand))
+                        {
+                            //Es existiert ein BVO für diesen Artikel mit BES_OK=1 - der aktuelle Artikel darf nicht verwendet werden
+                            //Kennzeichnung für Protokoll eintragen
+                            dispoItem.ExistsInOtherProposal = true;
+                        }
+
+                        //AL: 25.05.2017 CRM: 99225
+                        //Löschen von Einträgen aus anderen Bestellvorschlägen, wenn dort BES_OK nicht aktiviert ist
+                        //HS: Löschen von Einträgen aus anderen Bestellvorschlägen hier entfernt
+                        //sqlCommand = "delete from bestellvorschlag where profil<>:profil and artikelnummer=:artikelnummer and lager=:lager "
+                        //                       + " and beposinx is null and fainx is null and nvl(bes_ok,0)=:v0";
+                        //dbConn.CreateCommand();
+                        //dbConn.AddParameter("profil", PollexDBType.Number, request.ProfileNumber);
+                        //dbConn.AddParameter("artikelnummer", PollexDBType.Varchar, dispoItem.Item.sArtikelnummer);
+                        //dbConn.AddParameter("lager", PollexDBType.Number, dispoItem.StockNumber);
+                        //dbConn.AddParameter("v0", PollexDBType.SmallInt, 0);
+                        //dbConn.ExecuteCommand(sqlCommand);
+                    }
+
+                    // Artikel zu Liste hinzufügen.
+                    dispoItems.Add(dispoItem);
+                }
+            }
+            #endregion DataSet mit den Artikel aus der WhereBedingung erstellen
+
+            //GN 14.06.2021 CRM 127885: BeginTransaction verschoben
+            dbConn.BeginTransaction(IsolationLevel.ReadCommitted);
+
+            #region Einfügen in Tabelle Bestellvorschlag
+            // Liste der Artikel bei denen OK true ist erstellen
+            List<DispoManagerItem> InsertBVOItems = dispoItems.FindAll(d => d.OK == true);
+            // Liste mit OK=true in Tabelle Bestellvorschlag einfügen
+            if (polling != null)
+                polling.SetNextAction("Inserting items...", dsItems.Tables[0].Rows.Count);
+
+            double bestelltage = LC.LCFunctions.SystemSettings.Bestelltage(systemSettings.Reservation.LeadDays);
+
+            foreach (DispoManagerItem dispoItem in InsertBVOItems)
+            {
+                //AL: 25.05.2017 CRM: 99225
+                //Nur Artikel eintragen, die nicht in einem anderen Profil bereits BES_OK=1 haben
+                if (dispoItem.ExistsInOtherProposal)
+                    continue;
+
+                try
+                {
+                    if (polling != null)
+                    {
+                        polling.SetAsyncInfo("Insert item " + dispoItem.Item.sArtikelnummer + " into table...");
+                        polling.IncCurrentCount();
+                    }
+
+                    LC.LCFunctions.DTO.GlobalItemPosition pos = InitBVOItemPos(dispoItem, request.ProfileNumber.ParseLongN(), request.MultiCondition,
+                        request.AssemblyOrderDefaultCategory);
+
+                    if (request.CalculationTypes[0] == ExecuteDispoManagerCalculateEnum.BedarfDurchAndereLagerDecken)
+                    {
+                        #region Bedarf durch andere Lager decken
+                        // Bei Bedarf durch andere Lager decken sind keine Auftragsinfomationen erforderlich,
+                        // da ein Umbuchungsschein erstellt wird.
+                        pos.AuftragsNummer = double.NaN;
+                        pos.APosInx = double.NaN;
+
+                        double restQuantity = dispoItem.ProposalQuantity;
+                        foreach (var si in dispoItem.TransferFromStocks)
+                        {
+                            pos.Stueck = 0;
+
+                            if (restQuantity > 0 && si.Verfuegbar > 0)
+                            {
+                                if (restQuantity > si.Verfuegbar)
+                                {
+                                    pos.Stueck = si.Verfuegbar;
+                                    pos.BestellvorschlagStueck = si.Verfuegbar;
+                                }
+                                else
+                                {
+                                    pos.Stueck = restQuantity;
+                                    pos.BestellvorschlagStueck = restQuantity;
+                                }
+
+                            }
+
+                            if (pos.Stueck > 0)
+                            {
+                                pos.UmbuchungsLager = si.Lager;
+                                si.Umbuchungsmenge = pos.Stueck;
+
+                                // Neuer Index für ev. folgende Positionen 
+                                // Die Indexe werden für das erstellen der umbuchungsscheine benötigt. (List<double> Parameter)
+                                InsertIntoBVO(dbConn, systemSettings, pos, request, null);
+                                // CH 08.07.2020 CRM 122150: Index wird im InsertIntoBvo vergeben, daher erst danach im dispoItem zuordnen
+                                dispoItem.ProposalIndex = pos.Inx;
+                                result++;
+                            }
+
+                            restQuantity = restQuantity - pos.Stueck;
+                        }
+                        #endregion Bedarf durch andere Lager decken
+                    }
+                    else
+                    {
+                        if (!request.SeparatOrderRow && request.UpdateHistotyPurchasePrices)
+                        {
+                            #region Preiszuordnung für historische Aufträge
+                            List<HistoryOrderPosition> historyPositions = GetHistoryOrderPositions(dbConn, request.PurchasePriceFromOrderDate, pos.Artikelnummer, pos.Lager.ParseLong());
+                            //AL: 26.04.2017 CRM: 98267
+                            //Abfrage geändert, da sonst KEIN Eintrag in Bestellvorschlag erfolgt, wenn es KEINE historischen Aufträge abzuarbeiten gibt
+                            //if (historyPositions != null && historyPositions.Count > 0)
+                            if (historyPositions != null)
+                            {
+                                #region Je offener Auftragsposition eine eigene Zeile in Bestellvorschlag einfügen.
+                                double restQuantity = dispoItem.ProposalQuantity;
+
+                                foreach (var position in historyPositions)
+                                {
+                                    // Gesamte offene Auftragsmenge zwischenspeichern.
+                                    pos.OffeneAuftragsmenge = position.OpenQuantity;
+                                    double openQuantityForProposal = position.OpenQuantity;
+
+                                    if (openQuantityForProposal < 0)
+                                        openQuantityForProposal = 0;
+
+                                    if (restQuantity > openQuantityForProposal)
+                                        restQuantity = restQuantity - openQuantityForProposal;
+                                    else
+                                    {
+                                        if (restQuantity > 0)
+                                        {
+                                            openQuantityForProposal = restQuantity;
+                                            restQuantity = 0;
+                                        }
+                                        else
+                                            openQuantityForProposal = 0;
+                                    }
+
+                                    if (openQuantityForProposal > 0)
+                                    {
+                                        pos.Stueck = openQuantityForProposal;
+                                        pos.BestellvorschlagStueck = openQuantityForProposal;
+                                        pos.AuftragsNummer = position.OrderNumber;
+                                        pos.APosInx = position.APosInx;
+                                        pos.Lieferdatum = position.DeliveryDate;
+                                        //HS: 27.02.2020 CRM: 119775
+                                        pos.IstBonusFaehig = position.IsBonusablePP;
+
+                                        //AL: 18.07.2017 CRM: 98361
+                                        //Dieses Lieferdatum wird als "gewünschtes Lieferdatum" mit in die Bestellung übernommen. Damit die Ware
+                                        //rechtzeitig bestellt wird, muss die "Dispozeit" für Handlingdauer im Wareneingang mit berücksichtigt werden.
+                                        //Es wird also hier vom Liefertermin aus Auftrag eine Zeitspanne in Tagen in Abzug gebracht.                                        
+                                        //AL: 28.11.2017 CRM: 102651
+                                        //Abfrage auf MinValue eingebaut
+                                        if (systemSettings.Reservation.LeadDays > 0 && pos.Lieferdatum != DateTime.MinValue)
+                                            pos.Lieferdatum = pos.Lieferdatum.AddDays(systemSettings.Reservation.LeadDays * -1);
+
+                                        pos.GewuenschtesLieferDatum = position.DeliveryDate;
+                                        pos.Bezeichnung = position.Description1;
+                                        pos.Bezeichnung2 = position.Description2;
+                                        pos.Bezeichnung3 = position.Description3;
+                                        pos.MultiKondition = position.MultiCondition;
+                                        pos.LetzterEinkaufspreis = position.PurchasePrice;
+                                        pos.Bruttopreis = position.PurchasePrice;
+                                        pos.EkRabatt = 0;
+                                        //AL: 30.03.2017
+                                        //Online Sitzung Marcus Schmitz
+                                        //Da die Kumulierung auf Ebene Multikondition erfolgt, soll "eigene Bestellposition" nicht Default-Mäßig aktiviert sein
+                                        //pos.IstSonderpreis = true;
+                                        pos.IstSonderpreis = false;
+
+                                        // Lieferantennummer aus Auftrag
+                                        if (request.supplierEnum == ExecuteDispoManagerSupplierEnum.AusAuftrag && position.SupplierNumber.HasValue)
+                                        {
+                                            SupplierItemInfo sii = GetSupplierItemInfo(dbConn, systemSettings, pos.Artikelnummer, position.SupplierNumber);
+
+                                            if (sii != null)
+                                            {
+                                                pos.Lieferantennummer = position.SupplierNumber.Value;
+                                                pos.LieferantenName = position.SupplierName;
+
+                                                pos.LieferantenArtikelnummer = sii.sLieferantenArtikelnummer;
+                                                pos.AliefIndex = sii.nAliefIndex;
+                                                pos.Lieferzeit = sii.nLieferzeit;
+                                                pos.Preiseinheit = sii.nPreiseinheit;
+                                                pos.PreiseinheitCode = sii.nPreiseinheitCode;
+                                                pos.Bruttopreis = sii.nListenpreisAST;
+                                                pos.LetzterEinkaufspreis = sii.nLetzterEinkaufspreis;
+                                                pos.EkRabatt = sii.nEkRabatt;
+                                                pos.Faktor = sii.Faktor;
+                                                pos.IstSonderpreis = false;
+                                            }
+                                        }
+
+                                        InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                        result++;
+                                    }
+
+                                }
+
+                                // Die Restmenmge als Bestellvorschlag vür Lager eintragen
+                                if (restQuantity > 0)
+                                {
+                                    pos.Stueck = restQuantity;
+                                    pos.BestellvorschlagStueck = restQuantity;
+                                    pos.AuftragsNummer = double.NaN;
+                                    pos.APosInx = double.NaN;
+                                    pos.OffeneAuftragsmenge = null;
+                                    pos.Bezeichnung = dispoItem.Item.sBezeichnung1;
+                                    pos.Bezeichnung2 = dispoItem.Item.sBezeichnung2;
+                                    pos.Bezeichnung3 = dispoItem.Item.sBezeichnung3;
+                                    pos.MultiKondition = null;
+
+                                    //HS: 27.02.2020 CRM: 119775
+                                    pos.IstBonusFaehig = dispoItem.Item.bIstBonusfaehig;
+
+                                    //AL: 11.08.2016
+                                    //Wenn die Einstellung "Lieferant aus Auftrag" aktiviert ist, ist die pos Variable zwischenzeitlich mit anderen Lieferantendaten
+                                    //befüllt worden. Die lagerbezogene Zeile muss wieder mit den Daten des Hauptlieferanten befüllt werden                                                              
+                                    pos.Lieferantennummer = dispoItem.Item.nLieferantennummer;
+                                    pos.LieferantenName = dispoItem.Item.sLieferantenName;
+                                    pos.LieferantenArtikelnummer = dispoItem.Item.sLieferantenArtikelnummer;
+                                    pos.AliefIndex = dispoItem.Item.nAliefInx;
+                                    pos.Lieferzeit = dispoItem.Item.nLieferzeit;
+                                    pos.Preiseinheit = dispoItem.Item.nPreiseinheit_Alief;
+                                    pos.PreiseinheitCode = dispoItem.Item.nPeCode_ALief;
+                                    pos.Bruttopreis = dispoItem.Item.nListenpreis;
+                                    pos.LetzterEinkaufspreis = dispoItem.Item.nNettopreis;
+                                    pos.EkRabatt = dispoItem.Item.nRabatt;
+                                    pos.Faktor = dispoItem.Item.nFaktor_Alief;
+
+
+                                    if (dispoItem.Item.bIstBaugruppe && request.AssemblyRequirementFromOrders || request.AssemblyRequirementFromAssemblyOrders)
+                                        pos.Lieferdatum = DateTime.Today.AddDays(systemSettings.Production.LieferzeitFuerLagerFA);
+                                    else
+                                        pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit + bestelltage);
+                                    pos.GewuenschtesLieferDatum = pos.Lieferdatum;
+
+                                    InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                    result++;
+                                }
+
+
+                                #endregion Je Auftragsposition eine eigene Zeile in Bestellvorschlag einfügen.
+                            }
+                            #endregion Preiszuordnung für historische Aufträge
+                        }
+                        else
+                        {
+                            //HS: 22.10.2020 CRM: 124705
+                            //Für Sammelartikel wird eine eigene Bestellposition erstellt
+                            if ((request.SeparatOrderRow || dispoItem.Item.bIstSammelartikel)
+                                && (dispoItem.OpenOrderQuantity > 0 || dispoItem.OpenAssemblyOrderQuantity > 0))
+                            {
+                                double restQuantity = dispoItem.ProposalQuantity;
+
+                                if (dispoItem.OpenOrderQuantity > 0)
+                                {
+                                    #region Je Auftragsposition eine eigene Zeile in Bestellvorschlag einfügen.
+                                    foreach (var si in dispoItem.StockInfo)
+                                    {
+                                        if (si.OpenOrderQuantities != null)
+                                        {
+                                            foreach (var oi in si.OpenOrderQuantities)
+                                            {
+                                                //AL: 23.07.2019 CRM: 115815
+                                                //Bei der Variante "mit Summe aller Projektlager" ist automatisch auch der Haken "Alle ausgewählten Lager kumulieren" gesetzt.
+                                                //Dies ist erforderlich, da je dispoItem.StockInfo.OpenOrderQuantities ALLE Projektlager-Auftragspositionen angegeben sind.
+                                                //Diese würden sich sonst je gewähltem Lager aufmultiplizieren
+                                                //Um die Auftragsmengen richtig darzustellen kann in diesem Fall also die Abfrage auf oi.StockNumber == pos.Lager entfallen
+                                                //sofern es sich beim Lager der offenen Auftragsmengen um ein aktives Projektlager handelt
+                                                bool insertPosition = false;
+                                                if (!oi.IsNegativQuantity && !oi.IsLockedOrder)
+                                                {
+                                                    if (oi.StockNumber == pos.Lager)
+                                                    {
+                                                        insertPosition = true;
+                                                    }
+
+                                                    if (request.WithAllProjectStocks)
+                                                    {
+                                                        //AL: 23.07.2019 CRM: 115815
+                                                        //Wenn das Lager in der Liste der aktiven Projektlager ist, dafür eine Zeile in BESTELLVORSCHLAG erstellen
+                                                        if (allActiveProjectStocks != null &&
+                                                            allActiveProjectStocks.Find(x => x == oi.StockNumber.ParseDecimalNvl()) != null)
+                                                            insertPosition = true;
+                                                    }
+
+                                                    if (request.CumulateAllStocks)
+                                                    {
+                                                        //AL: 23.07.2019 CRM: 115815
+                                                        //Ist der Schalter "Alle ausgewählten Lager kumulieren" gesetzt, dann werden auch offene Aufträge von den gewählten Lagern mit deren Auftragsnummer hier gelistet
+                                                        insertPosition = true;
+                                                    }
+                                                }
+
+                                                if (insertPosition)
+                                                {
+                                                    pos = InitBVOItemPos(dispoItem, request.ProfileNumber.ParseLongN(), request.MultiCondition,
+                                                        request.AssemblyOrderDefaultCategory);
+
+                                                    //HS: 03.12.2019 CRM: 87786
+                                                    //Bonusfähig aus Bonusfähig-EK der Auftragsposition übernehmen
+                                                    pos.IstBonusFaehig = oi.IsBonusable;
+
+                                                    // Gesamte offene Auftragsmenge zwischenspeichern.
+                                                    pos.OffeneAuftragsmenge = oi.OpenQuantity - oi.PurchaseOrderQuantity;
+                                                    double openQuantityForProposal = oi.OpenQuantity - oi.PurchaseOrderQuantity;
+
+                                                    //AL: 13.07.2016 CRM: 91757
+                                                    //Berücksichtigung von bereits existierenden Fertigungsaufträgen (auch lagerbezogene FA über Tabelle BESTELLVORSCHLAG)
+                                                    //Die Bestellvorschlagsmenge wird um die Menge der offenen Fertigungsaufträge reduziert
+                                                    //AL: 31.05.2017 CRM: 99294
+                                                    //Wenn im Bestellprofil "Lagerbezogener Fertigungsauftrag" (FA_LAGERBEZOGEN) gesetzt ist, dann sollen die 
+                                                    //vorgeschlagenen Aufträge nur jene Aufträge sein, zu denen es nicht bereits eine Verknüpfung über die Tabelle
+                                                    //BESTELLVORSCHLAG gibt
+                                                    if (oi.IsAssemblyOrderExists)
+                                                        openQuantityForProposal = openQuantityForProposal - oi.AssemblyOrderQuantity;
+                                                    if (request.StockRelatedAssemblyOrder)
+                                                    {
+                                                        //die zu dieser Position bereits verknüpften lagerbezogenen Fertigungsmengen in Abzug bringen
+                                                        openQuantityForProposal = openQuantityForProposal - oi.StockRelatedAssemblyOrderQuantity;
+                                                    }
+
+                                                    if (openQuantityForProposal < 0)
+                                                        openQuantityForProposal = 0;
+
+                                                    if (restQuantity > openQuantityForProposal)
+                                                        restQuantity = restQuantity - openQuantityForProposal;
+                                                    else
+                                                    {
+                                                        if (restQuantity > 0)
+                                                        {
+                                                            openQuantityForProposal = restQuantity;
+                                                            restQuantity = 0;
+                                                        }
+                                                        else
+                                                            openQuantityForProposal = 0;
+                                                    }
+
+                                                    //if (oi.OpenQuantity > 0)      // HS: 29.03.2016 VG: 89933
+                                                    if (openQuantityForProposal > 0)
+                                                    {
+                                                        pos.Stueck = openQuantityForProposal;
+                                                        pos.BestellvorschlagStueck = openQuantityForProposal;
+                                                        pos.AuftragsNummer = oi.OrderNumber;
+                                                        pos.APosInx = oi.APosInx;
+                                                        pos.Lieferdatum = oi.DeliveryDate;
+                                                        pos.ProjektNummer = oi.ProjectNumber;
+                                                        pos.ProjektName = oi.ProjectName;
+
+                                                        //AL: 18.07.2017 CRM: 98361
+                                                        //Dieses Lieferdatum wird als "gewünschtes Lieferdatum" mit in die Bestellung übernommen. Damit die Ware
+                                                        //rechtzeitig bestellt wird, muss die "Dispozeit" für Handlingdauer im Wareneingang mit berücksichtigt werden.
+                                                        //Es wird also hier vom Liefertermin aus Auftrag eine Zeitspanne in Tagen in Abzug gebracht.
+                                                        //AL: 28.11.2017 CRM: 102651
+                                                        //Abfrage auf MinValue eingebaut
+                                                        #region Lieferdatum
+                                                        if (systemSettings.PurchaseOrders.UseSupplierDeliveryTime)
+                                                        {
+                                                            //HS: 03.12.2020 CRM: 123339
+                                                            //Immer das Lieferdatum mit der Lieferzeit aus ALIEF berechnen
+                                                            pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit);
+                                                        }
+                                                        else
+                                                        {
+                                                            if (systemSettings.Reservation.LeadDays > 0 && pos.Lieferdatum != DateTime.MinValue)
+                                                                pos.Lieferdatum = pos.Lieferdatum.AddDays(systemSettings.Reservation.LeadDays * -1);
+
+                                                        }
+                                                        pos.GewuenschtesLieferDatum = oi.DeliveryDate;
+                                                        #endregion Lieferdatum
+                                                        pos.Bezeichnung = oi.Description1;
+                                                        pos.Bezeichnung2 = oi.Description2;
+                                                        pos.Bezeichnung3 = oi.Description3;
+                                                        pos.MultiKondition = oi.MultiCondition;
+
+                                                        // Lieferantennummer aus Auftrag
+                                                        if (request.supplierEnum == ExecuteDispoManagerSupplierEnum.AusAuftrag && oi.SupplierNumber.HasValue)
+                                                        {
+                                                            //AL: 11.08.2016 CRM: 90764/23
+                                                            //Nachselektieren der benötigten Daten aus ALIEF
+                                                            SupplierItemInfo sii = GetSupplierItemInfo(dbConn, systemSettings, pos.Artikelnummer, oi.SupplierNumber);
+
+                                                            if (sii != null)
+                                                            {
+                                                                pos.Lieferantennummer = oi.SupplierNumber.Value;
+                                                                pos.LieferantenName = oi.SupplierName;
+
+                                                                pos.LieferantenArtikelnummer = sii.sLieferantenArtikelnummer;
+                                                                pos.AliefIndex = sii.nAliefIndex;
+                                                                pos.Lieferzeit = sii.nLieferzeit;
+                                                                pos.Preiseinheit = sii.nPreiseinheit;
+                                                                pos.PreiseinheitCode = sii.nPreiseinheitCode;
+                                                                pos.Bruttopreis = sii.nListenpreisAST;
+                                                                pos.LetzterEinkaufspreis = sii.nLetzterEinkaufspreis;
+                                                                pos.EkRabatt = sii.nEkRabatt;
+                                                                pos.Faktor = sii.Faktor;
+                                                            }
+                                                        }
+                                                        // Einkaufspreis aus Auftrag
+                                                        if (request.PurchasePriceFromOrder && oi.PurchasePrice.HasValue)
+                                                        {
+                                                            pos.LetzterEinkaufspreis = oi.PurchasePrice.Value.ParseDouble();
+                                                            pos.Bruttopreis = oi.PurchasePrice.Value.ParseDouble();
+                                                            pos.EkRabatt = 0;
+                                                            pos.IstSonderpreis = true;
+                                                        }
+
+                                                        InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                                        result++;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+
+
+                                    }
+
+
+                                    #endregion Je Auftragsposition eine eigene Zeile in Bestellvorschlag einfügen.
+                                }
+
+                                if (dispoItem.OpenAssemblyOrderQuantity > 0)
+                                {
+                                    #region Je FA-Position eine eigene Zeile in Bestellvorschlag einfügen.
+                                    if (restQuantity > 0)
+                                    {
+                                        if (dispoItem.OpenAssemblyOrderQuantities != null)
+                                        {
+                                            //Zur Zuteilung von Projektlagerbeständen die Projektlagerinfo kopieren
+                                            //+++
+                                            foreach (var assemblyOrder in dispoItem.OpenAssemblyOrderQuantities)
+                                            {
+                                                //AL: 17.06.2018 CRM: 105537
+                                                //BVO-Mengen auf den neuesten Fertigungsauftrag zuordnen, von dort absteigend
+                                                //Es wird davon ausgegangen, dass die neuesten FA noch keine Bestellung haben
+
+                                                double quantityToAssign = assemblyOrder.OpenTransferQuantity;
+
+                                                //AL: 06.02.2019 CRM: 110340
+                                                //Wenn die offene Umbuchungsmenge eines Fertigungsauftrags gleich 0 ist, dann kann für diesen FA 
+                                                //nicht mehr bestellt werden -> nächsten FA versuchen
+                                                if (quantityToAssign > 0)
+                                                {
+                                                    //AL: 04.06.2020 CRM: 122213/6
+                                                    //Die ermittelten BVO Mengen dürfen nur auf Fertigungsaufträge MIT Bestellfreigabe zugeordnet werden
+                                                    //Hat der FA keine Bestellfreigabe, wird der nächste FA verwendet
+                                                    if (assemblyOrder.IsOrderApproval)
+                                                    {
+                                                        //Von der zugewiesenen Menge die am Lager verfügbare Menge abziehen
+                                                        if (dispoItem.ProjectStockInfo != null)
+                                                        {
+                                                            ProjectStockInfo psi = dispoItem.ProjectStockInfo.Find(x => x.ProjektLager == assemblyOrder.StockNumber);
+                                                            if (psi != null)
+                                                            {
+                                                                quantityToAssign = quantityToAssign - psi.Bestand;
+                                                                if (quantityToAssign < 0)
+                                                                    quantityToAssign = 0;
+                                                            }
+                                                        }
+
+                                                        if (quantityToAssign >= restQuantity)
+                                                        {
+                                                            quantityToAssign = restQuantity;
+                                                            restQuantity = 0;
+                                                        }
+                                                        else
+                                                        {
+                                                            restQuantity = restQuantity - quantityToAssign;
+                                                        }
+
+                                                        //AL: 06.02.2019 CRM: 110340
+                                                        //Einfügen in die Tabelle BESTELLVORSCHLAG nur dann wenn auch STUECK>0 ist, also wenn FA-Mengen zugeordnet wurden
+                                                        if (quantityToAssign > 0)
+                                                        {
+                                                            pos = InitBVOItemPos(dispoItem, request.ProfileNumber.ParseLongN(), request.MultiCondition,
+                                                                request.AssemblyOrderDefaultCategory);
+                                                            pos.Stueck = quantityToAssign;
+                                                            pos.BestellvorschlagStueck = quantityToAssign;
+                                                            pos.FertigungsauftragsNummer = assemblyOrder.AssemblyOrderNumber;
+                                                            #region Lieferdatum
+                                                            if (systemSettings.PurchaseOrders.UseSupplierDeliveryTime)
+                                                            {
+                                                                //HS: 03.12.2020 CRM: 123339
+                                                                //Immer das Lieferdatum mit der Lieferzeit aus ALIEF berechnen
+                                                                pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit);
+                                                            }
+                                                            else
+                                                            {
+                                                                if (assemblyOrder.StartDate.HasValue)
+                                                                    pos.Lieferdatum = assemblyOrder.StartDate.Value;
+
+                                                            }
+                                                            #endregion Lieferdatum
+                                                            pos.ProjektNummer = assemblyOrder.ProjectNumber;
+                                                            pos.ProjektName = assemblyOrder.ProjectName;
+
+                                                            InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                                            result++;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    #endregion
+                                }
+
+                                #region Restmengen für Lager einfügen
+                                if (restQuantity > 0)
+                                {
+                                    pos.Stueck = restQuantity;
+                                    pos.BestellvorschlagStueck = restQuantity;
+                                    pos.AuftragsNummer = double.NaN;
+                                    pos.APosInx = double.NaN;
+                                    pos.OffeneAuftragsmenge = null;
+                                    pos.Bezeichnung = dispoItem.Item.sBezeichnung1;
+                                    pos.Bezeichnung2 = dispoItem.Item.sBezeichnung2;
+                                    pos.Bezeichnung3 = dispoItem.Item.sBezeichnung3;
+                                    pos.MultiKondition = null;
+
+                                    //AL: 11.08.2016
+                                    //Wenn die Einstellung "Lieferant aus Auftrag" aktiviert ist, ist die pos Variable zwischenzeitlich mit anderen Lieferantendaten
+                                    //befüllt worden. Die lagerbezogene Zeile muss wieder mit den Daten des Hauptlieferanten befüllt werden                                                              
+                                    pos.Lieferantennummer = dispoItem.Item.nLieferantennummer;
+                                    pos.LieferantenName = dispoItem.Item.sLieferantenName;
+                                    pos.LieferantenArtikelnummer = dispoItem.Item.sLieferantenArtikelnummer;
+                                    pos.AliefIndex = dispoItem.Item.nAliefInx;
+                                    pos.Lieferzeit = dispoItem.Item.nLieferzeit;
+                                    pos.Preiseinheit = dispoItem.Item.nPreiseinheit_Alief;
+                                    pos.PreiseinheitCode = dispoItem.Item.nPeCode_ALief;
+                                    pos.Bruttopreis = dispoItem.Item.nListenpreis;
+                                    pos.LetzterEinkaufspreis = dispoItem.Item.nNettopreis;
+                                    pos.EkRabatt = dispoItem.Item.nRabatt;
+                                    pos.Faktor = dispoItem.Item.nFaktor_Alief;
+                                    pos.IstBonusFaehig = dispoItem.Item.bIstBonusfaehig;
+
+                                    #region Lieferdatum
+                                    if (systemSettings.PurchaseOrders.UseSupplierDeliveryTime)
+                                    {
+                                        //HS: 03.12.2020 CRM: 123339
+                                        //Immer das Lieferdatum mit der Lieferzeit aus ALIEF berechnen
+                                        pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit);
+                                    }
+                                    else
+                                    {
+                                        if (dispoItem.Item.bIstBaugruppe && request.AssemblyRequirementFromOrders || request.AssemblyRequirementFromAssemblyOrders)
+                                            pos.Lieferdatum = DateTime.Today.AddDays(systemSettings.Production.LieferzeitFuerLagerFA);
+                                        else
+                                            pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit + bestelltage);
+                                    }
+                                    pos.GewuenschtesLieferDatum = pos.Lieferdatum;
+                                    #endregion Lieferdatum
+
+                                    InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                    result++;
+
+                                    restQuantity = 0;
+                                }
+                                #endregion
+                            }
+                            else
+                            {
+                                #region Einfügen in Bestellvorschlag für Lager
+
+                                #region Lieferdatum
+                                if (systemSettings.PurchaseOrders.UseSupplierDeliveryTime)
+                                {
+                                    //HS: 03.12.2020 CRM: 123339
+                                    //Immer das Lieferdatum mit der Lieferzeit aus ALIEF berechnen
+                                    pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit);
+                                }
+                                else
+                                {
+                                    // Nur eine Zeile des Artikel mit der gesamten Bestellvorschlagsmenge in Bestellvorschlag einfügen.
+                                    if (dispoItem.Item.bIstBaugruppe && request.AssemblyRequirementFromOrders || request.AssemblyRequirementFromAssemblyOrders)
+                                    {
+                                        pos.Lieferdatum = DateTime.Today.AddDays(systemSettings.Production.LieferzeitFuerLagerFA);
+                                    }
+                                    else
+                                    {
+                                        pos.Lieferdatum = DateTime.Today.AddDays(dispoItem.Item.nLieferzeit.ParseDoubleNvl() + bestelltage);
+                                    }
+
+                                    // PH, 15.04.2016 (VG 87002): Liefertermin aus Materialdeckung ermitteln
+                                    if (request.AssemblyOrderDeliveryDateFromMaterialCoverage)
+                                    {
+                                        DateTime? deliveryDate = null;
+
+                                        // Materialdeckung ermitteln
+                                        bool itemWithoutProductionTransfer = false;
+                                        var materialCoverage = LC.LCFunctions.AdditionalPrograms.Production.MaterialCoverage
+                                            .GetMaterialCoverage(dbConn, systemSettings, dispoItem.Item.sArtikelnummer, systemSettings.Production.MaterialCoverageStocks, null, false, false, false, out itemWithoutProductionTransfer);
+                                        if (materialCoverage.HasValues())
+                                        {
+                                            // Erstes Datum ermitteln, an dem Bestand kleiner als 0 ist.
+                                            foreach (var mat in materialCoverage)
+                                            {
+                                                if (mat.TotalStockLevel.HasValue && mat.TotalStockLevel.Value < 0)
+                                                {
+                                                    // Nach dem ersten Treffer die Schleife verlassen, da die DataTable bereits sortiert ist.
+                                                    deliveryDate = mat.BookingDate;
+
+                                                    // Von dem Datum die Dispo-Tage subtrahieren, um das endgültige Datum zu erhalten.
+                                                    deliveryDate = deliveryDate.Value.AddDays(-1 * systemSettings.Production.LeadDays);
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if (deliveryDate.HasValue)
+                                        {
+                                            pos.Lieferdatum = deliveryDate.Value;
+                                        }
+                                    }
+                                }
+
+                                pos.GewuenschtesLieferDatum = pos.Lieferdatum;
+                                #endregion Lieferdatum
+
+                                InsertIntoBVO(dbConn, systemSettings, pos, request, userOrgUnitStockNo);
+                                result++;
+
+                                #endregion Einfügen in Bestellvorschlag für Lager
+                            }
+                        }
+                    }
+
+                    // Für Reporting
+                    dispoItem.ProposalIndex = pos.Inx;
+
+                }
+                catch (Exception ex)
+                {
+                    string message = "Error at inserting items - item number: " + dispoItem.Item.sArtikelnummer;
+                    throw new Exception(message + Environment.NewLine + ex.ToString());
+                }
+            }
+            #endregion Einfügen in Tabelle Bestellvorschlag
+
+            if (anTmpInx.HasValue)
+            {
+                // Alle Artikel aus dem Select auf Artikelstamm ausschliessen welche in der Tabelle AN_TMP sind
+                sqlCommand = "delete from an_tmp where inx=:inx";
+                dbConn.AddParameter("inx", PollexDBType.Number, anTmpInx.Value);
+                dbConn.ExecuteCommand(sqlCommand);
+            }
+
+            if (anBgInx.HasValue)
+            {
+                // Alle Artikel aus dem Select auf Artikelstamm ausschliessen welche in der Tabelle AN_TMP sind
+                sqlCommand = "delete from an_tmp where inx=:inx";
+                dbConn.AddParameter("inx", PollexDBType.Number, anBgInx.Value);
+                dbConn.ExecuteCommand(sqlCommand);
+            }
+            stopClock.Stop();
+
+            #region Reporting
+            if (!string.IsNullOrEmpty(logFileName))
+            {
+                // Pete 27.11.2019: Es muss ab jetzt immer der vollständige Dateiname übergeben werden
+                //string fileName = Path.Combine(systemSettings.CompanyPath, "Debug", logFileName);
+                string fileName = logFileName;
+
+                LC.Reporting.Reporting rep = new Reporting.Reporting();
+                rep.CreateReport(fileName, "Dispo - Manager (V2)", stopClock);
+                #region Übergabeparameter
+                rep.CreateReportingCaption("functionParameter", true, "Übergabeparameter");
+                rep.CreateReportingTableRow("Datenbank", dbConn.Database, 3, -999);
+                rep.CreateReportingTableRow("Benutzername", dbConn.DbUser, 3, -999);
+                rep.CreateReportingTableRow("Profilnummer", request.ProfileNumber, 3, -999);
+                rep.CreateReportingTableRow("Lagernummern", stockNumberList, 3, -999);
+                rep.CreateReportingTableRow("Mit allen Projektlagern", request.WithAllProjectStocks, 3, -999);
+                rep.CreateReportingTableRow("Lieferantennummern", request.SupplierNumber, 3, -999);
+                rep.CreateReportingTableRow("Hersteller", request.Manufacturer, 3, -999);
+                rep.CreateReportingTableRow("Hauptgruppen", request.MainGroupNumber, 3, -999);
+                rep.CreateReportingTableRow("Sortimente", request.AssortmentNumber, 3, -999);
+                rep.CreateReportingTableRow("Gruppen", request.GroupNumber, 3, -999);
+                rep.CreateReportingTableRow("Reihen", request.RowNumber, 3, -999);
+                rep.CreateReportingTableRow("Benutzer 1", request.User1, 3, -999);
+                rep.CreateReportingTableRow("Benutzer 2", request.User2, 3, -999);
+                rep.CreateReportingTableRow("Benutzer 3", request.User3, 3, -999);
+                rep.CreateReportingTableRow("Grafik 1", request.Graphic1, 3, -999);
+                rep.CreateReportingTableRow("Grafik 2", request.Graphic2, 3, -999);
+                rep.CreateReportingTableRow("Grafik 3", request.Graphic3, 3, -999);
+                rep.CreateReportingTableRow("Abfragebedingung", request.Query, 3, -999);
+                rep.CreateReportingTableRow("Artikelrabattgruppe", request.ItemDiscountGroup, 3, -999);
+                rep.CreateReportingTableRow("Dispo Kennzeichen aus Lager", request.UseStockAvailabiltySign, 3, -999);
+                rep.CreateReportingTableRow("Dispo Kennzeichen", request.AvailabiltySign, 3, -999);
+                rep.CreateReportingTableRow("List Kennzeichen", request.ListSign, 3, -999);
+                rep.CreateReportingTableRow("Multikondition", request.MultiCondition, 3, -999);
+                rep.CreateReportingTableRow("Nur Artikel ohne Zuordnung zu einer Multikondition", request.ItemsWithoutMultiCondition, 3, -999);
+                rep.CreateReportingTableRow("Alle Lager kumulieren", request.CumulateAllStocks, 3, -999);
+                rep.CreateReportingTableRow("Lager für Lagerkumulierung", request.StockNumberCumulate, 3, -999);
+                rep.CreateReportingTableRow("Mit gesperrten Artikeln", request.WithLockedItems, 3, -999);
+                rep.CreateReportingTableRow("Mit unvollständigen Artikeln", request.WithIncompleteItems, 3, -999);
+                rep.CreateReportingTableRow("Mit Auslaufartikeln", request.WithSuspendedItems, 3, -999);
+                rep.CreateReportingTableRow("Mit Durchlaufartikeln", request.WithPassThroughItems, 3, -999);
+                if (request.AssemblyItems.HasValue)
+                    rep.CreateReportingTableRow("Baugruppen-/Produktionsartikel", request.AssemblyItems.Value, 3, -999);
+                else
+                    rep.CreateReportingTableRow("Keine Einschränkung auf Baugruppen-/Produktionsartikel", null, 3, -999);
+                rep.CreateReportingTableRow("Mit Variantenprüfung", request.WithVariantCheck, 3, -999);
+                rep.CreateReportingTableRow("Lieferantenauswahl", request.supplierEnum.ToString(), 3, -999);
+                //rep.CreateReportingTableRow("Hauptlieferant", request.MainSupplier, 3, -999);
+                rep.CreateReportingTableRow("Einkaufspreis aus Auftrag", request.PurchasePriceFromOrder, 3, -999);
+                foreach (var type in request.InclusionTypes)
+                    rep.CreateReportingTableRow("Aufnahme in Bestellvorschlag", type.GetStringValue(), 3, -999);
+                foreach (var type in request.CalculationTypes)
+                    rep.CreateReportingTableRow("Berechnung Bestellvorschlagsmenge", type.GetStringValue(), 3, -999);
+                rep.CreateReportingTableRow("Disponible Menge kleiner Reichweite in Tagen", request.RangeDays, 3, -999);
+                rep.CreateReportingTableRow("Auffüllung auf Reichweite in Tagen", request.UpToRangeDays, 3, -999);
+                rep.CreateReportingTableRow("Bedarf durch folgende Lager decken", request.OtherStockNumber, 3, -999);
+                rep.CreateReportingTableRow("Dispokennzeichen für andere Lager", request.AvailabiltySignCoverage, 3, -999);
+                rep.CreateReportingTableRow("Offene Aufträge berücksichtigen von Datum", request.OrderDateFrom, 3, -999);
+                rep.CreateReportingTableRow("Offene Aufträge berücksichtigen bis Datum", request.OrderDateTo, 3, -999);
+                rep.CreateReportingTableRow("Offene Aufträge berücksichtigen von Lieferdatum", request.DeliveryDateFrom, 3, -999);
+                rep.CreateReportingTableRow("Offene Aufträge berücksichtigen bis Lieferdatum", request.DeliveryDateTo, 3, -999);
+                rep.CreateReportingTableRow("Nur Aufträge mit folgenden Abrufcodes selektieren", request.DisposalCodes, 3, -999);
+                rep.CreateReportingTableRow("Offene Bestellungen berücksichtigen von Datum", request.PurchaseOrderDateFrom, 3, -999);
+                rep.CreateReportingTableRow("Offene Bestellungen berücksichtigen bis Datum", request.PurchaseOrderDateTo, 3, -999);
+                rep.CreateReportingTableRow("Mit Lagerbestand", request.WithStockQuantities, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Aufträgen", request.WithOpenOrders, 3, -999);
+                rep.CreateReportingTableRow("Ohne gelieferte Mengen", request.WithoutDeliveredQuantities, 3, -999);
+                rep.CreateReportingTableRow("Mit kommissionierten Mengen", request.WithCommissionedQuantities, 3, -999);
+                rep.CreateReportingTableRow("Mit Planaufträgen", request.WithPlannedOrders, 3, -999);
+                rep.CreateReportingTableRow("Mit Rahmenaufträgen", request.WithFrameOrders, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Aufträgen", request.WithOpenOrders, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Bestellungen", request.WithOpenPurchaseOrders, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Rahmenestellungen", request.WithFramePurchaseOrders, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Lagerumbuchungen", request.WithOpenStockTransfers, 3, -999);
+                rep.CreateReportingTableRow("Mit offenen Fertigungsaufträgen", request.WithOpenAssemblyOrders, 3, -999);
+                rep.CreateReportingTableRow("Negative Auftragsmengen berücksichtigen", request.NegativOrderQuantity, 3, -999);
+                rep.CreateReportingTableRow("Materialbedarf für Projekt aus Kundenauftrag", request.MaterialRequirement, 3, -999);
+                rep.CreateReportingTableRow("Organisatorische Einheiten für Fertigungsaufträge", request.OrganisationUnits, 3, -999);
+                rep.CreateReportingTableRow("Baugruppenbedarf aus Kundenaufträgen", request.AssemblyRequirementFromOrders, 3, -999);
+                rep.CreateReportingTableRow("Baugruppenbedarf aus Fertigungsaufträgen", request.AssemblyRequirementFromAssemblyOrders, 3, -999);
+                rep.CreateReportingTableRow("Baugruppenbedarf aus linearem Verbrauch", request.AssemblyRequirementFromLinConsumption, 3, -999);
+                rep.CreateReportingTableRow("Ohne Artikel aus offenen Projektumbuchungen", request.WithoutOpenProjectStockTransfers, 3, -999);
+                rep.CreateReportingTableRow("Offene Fertigungsaufträge für Bedarfe berücksichtigen von Startdatum", request.AssemblyOrderStartDateFrom, 3, -999);
+                rep.CreateReportingTableRow("Offene Fertigungsaufträge für Bedarfe berücksichtigen bis Startdatum", request.AssemblyOrderStartDateTo, 3, -999);
+                rep.CreateReportingTableRow("Offene Fertigungsaufträge für Produktion berücksichtigen von Startdatum", request.AssemblyOrderStartDate2From, 3, -999);
+                rep.CreateReportingTableRow("Offene Fertigungsaufträge für Produktion berücksichtigen bis Startdatum", request.AssemblyOrderStartDate2To, 3, -999);
+                rep.CreateReportingTableRow("Bedarf für Fertigungsaufträge für Lager aufnehmen", request.AssemblyStockNumber, 3, -999);
+                rep.CreateReportingTableRow("Bedarf für Fertigungsaufträge je selektierten Lager aufnehmen", request.SelectedStockNumber, 3, -999);
+                rep.CreateReportingTableRow("Wochenbedarf aus linearem Monatsverbrauch berechnen", request.WeeksForLinearConsumption, 3, -999);
+                rep.CreateReportingTableRow("Nur Artikel mit Kennzeichen linear in Lagerbestand", request.JustLinearItems, 3, -999);
+                rep.CreateReportingTableRow("Angemeldeter Benutzers", dbConn.DbUser, 3, -999);
+                rep.CreateReportingTableRow("Organisatorische Einheit des angemeldeten Benutzers", request.UserOrgUnit, 3, -999);
+                rep.CreateReportingTableRow("Lagernummer der Organisaton des angemeldeten Benutzers", userOrgUnitStockNo, 3, -999);
+                rep.CreateReportingTableRow("Eigene Bestellvorschlagszeile je offener Auftragsposition", request.SeparatOrderRow, 3, -999);
+                rep.CreateReportingTableRow("Preiszuordnung für historische Aufträge", request.UpdateHistotyPurchasePrices, 3, -999);
+                rep.CreateReportingTableRow("Historische Preiszuordnung in Aufträge ab Auftragsdatum", request.PurchasePriceFromOrderDate, 3, -999);
+                rep.SectionEnd();
+                #endregion Übergabeparameter
+                #region Grundlageneinstellungen
+                rep.CreateReportingCaption("systemSetting", true, "Grundlageneinstellungen");
+                rep.CreateReportingTableRow("Bestellvorschlag mit Durchlaufartikeln", systemSettings.PurchaseOrders.BestellvorschlagMitDurchlaufartikel, 3, -999);
+                rep.CreateReportingTableRow("Linearer Verbrauch. Monate in die Vergangenheit", systemSettings.PurchaseOrders.BestellvorschlagMonateVergangenheit, 3, -999);
+                rep.CreateReportingTableRow("Linearer Verbrauch. Monate in die Zukunft", systemSettings.PurchaseOrders.BestellvorschlagMonateZukunft, 3, -999);
+                rep.CreateReportingTableRow("Reichweiten verwenden", systemSettings.DWHConsumption.UseRange, 3, -999);
+                rep.CreateReportingTableRow("Reichweiten mit Gewichtung", systemSettings.DWHConsumption.RangeWithWeighting, 3, -999);
+                rep.CreateReportingTableRow("Anzahl Wochen für Reichweitenberechnung", systemSettings.DWHConsumption.ConsumptionPeriodForRange, 3, -999);
+                rep.CreateReportingTableRow("Verkaufstage je Woche", systemSettings.DWHConsumption.SalesDaysPerWeek, 3, -999);
+                rep.CreateReportingTableRow("Produktion ohne Materialumbuchung", systemSettings.Production.ProductionWithoutStocktransfer, 3, -999);
+                rep.CreateReportingTableRow("Verfügbare Menge über Produktionsausweis berechnen", systemSettings.Production.VerfuegbarUeberProduktionsausweis, 3, -999);
+                rep.CreateReportingTableRow("Bestellpositionen sofort aus Eingangslieferschein aktualisieren", systemSettings.PurchaseOrders.GelieferteMengeSofortAktualisieren, 3, -999);
+                rep.CreateReportingTableRow("Immer Standardlieferzeit des Lieferanten verwenden", systemSettings.PurchaseOrders.UseSupplierDeliveryTime, 3, -999);
+                rep.CreateReportingTableRow("Produktionslagernummer", LC.Globals.Constants.SYSTEMSTOCK_PRODUCTION, 3, -999);
+                //HS: 18.08.2022 CRM: 139050
+                rep.CreateReportingTableRow("Artikeleigenschaften je organisatorischer Einheit", systemSettings.ItemMasterData.UseItemAttributesPerOrgUnit, 3, -999);
+                //Produktionslager der übergebenen OE's auflisten
+                if (request.OrganisationUnits != null && request.OrganisationUnits.Count > 0)
+                {
+                    foreach (var value in request.OrganisationUnits)
+                    {
+                        if (orgUnits.ContainsKey(value.ParseDouble()))
+                        {
+                            double prodStockNo = orgUnits[value.ParseDouble()].ParseDouble();
+                            rep.CreateReportingTableRow("Produktionslagernummer für Organisation " + value.ParseDouble().ToString(), prodStockNo, 3, -999);
+                        }
+                    }
+                }
+                rep.SectionEnd();
+                #endregion
+
+                #region Alle Artikeln auflisten
+                foreach (DispoManagerItem dispoItem in dispoItems)
+                {
+                    string title = "";
+
+                    if (dispoItem.RealTotalStockQuantity == 0 && dispoItem.TotalStockQuantity == 0 && dispoItem.OpenOrderQuantity == 0
+                        && dispoItem.OpenPlannedOrderQuantity == 0 && dispoItem.OpenFrameOrderQuantity == 0 && dispoItem.OpenAssemblyOrderQuantity == 0
+                        && dispoItem.AvailableQuantity == 0 && dispoItem.OpenPurchaseOrderQuantity == 0 && dispoItem.OpenGoodsReiceiptQuantity == 0
+                        && dispoItem.DisponibleQuantity == 0 && dispoItem.ProposalQuantity == 0 && request.LoggingLevel == ProtocolLevel.Normal)
+                    {
+                        // Artikel nicht exprtieren, da aller Werte in der Berechnung 0,00 sind.
+                        // Vorgang 77562, Aufgabe 2
+                        continue;
+                    }
+
+
+                    rep.CreateReportingCaption("item" + dispoItem.Item.sArtikelnummer + "stock" + dispoItem.StockNumber.ToString(), true, "Lager: " + dispoItem.StockNumber.ToString() + "  Artikel: " + dispoItem.Item.sArtikelnummer);
+                    rep.CreateReportingTableRow("OK", dispoItem.OK, 3, -999);
+                    if (dispoItem.OK)
+                        rep.CreateReportingTableRow("BESTELLVORSCHLAG.INX", dispoItem.ProposalIndex, 3, -999);
+                    rep.CreateReportingTableRow("Lieferantennummer", dispoItem.Item.nLieferantennummer.ToString(), 3, -999);
+                    //HS: 18.08.2022 CRM: 139050
+                    rep.CreateReportingTableRow("Hauptlieferant aus OE-Eigenschaften", dispoItem.Item.MainSupplierFromOU, 3, -999);
+                    rep.CreateReportingTableRow("Lagernummer", dispoItem.StockNumber, 3, -999);
+                    rep.CreateReportingTableRow("Artikelnummer", dispoItem.Item.sArtikelnummer, 3, -999);
+                    rep.CreateReportingTableRow("Bezeichnung 1", dispoItem.Item.sBezeichnung1, 3, -999);
+                    if (!string.IsNullOrWhiteSpace(dispoItem.Item.sBezeichnung2))
+                        rep.CreateReportingTableRow("Bezeichnung 2", dispoItem.Item.sBezeichnung2, 3, -999);
+                    rep.CreateReportingTableRow("Baugruppenartikel", dispoItem.Item.bIstBaugruppe, 3, -999);
+                    rep.CreateReportingTableRow("Durchlaufartikel", dispoItem.Item.bIstDurchlaufartikel, 3, -999);
+                    rep.CreateReportingTableRow("Auslaufartikel", dispoItem.Item.bIstAuslaufartikel, 3, -999);
+                    rep.CreateReportingTableRow("Keine Verbrauchsbuchung", dispoItem.Item.bKeineVerbrauchsbuchung, 3, -999);
+                    rep.CreateReportingTableRow("nur Ganze Mengeneinheiten", dispoItem.Item.bGanzeMengeneinheit, 3, -999);
+                    rep.CreateReportingTableRow("Mengeneinheit der ganzen Mengeneinheit", dispoItem.Item.sGanzeMengeneinheit, 3, -999);
+                    rep.CreateReportingTableRow("Lagermengeneinheit", dispoItem.Item.sLagerMengeneinheit, 3, -999);
+                    rep.CreateReportingTableRow("Einkaufsmengeneinheit", dispoItem.Item.sEinkaufsMengeneinheit, 3, -999);
+                    rep.CreateReportingTableRow("Bestellmengeneinheit", dispoItem.Item.sBestellMengeneinheit, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Einkaufsmengeneinheiten Faktor", dispoItem.Item.nFaktor_Alief, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Bestellmengeneinheiten Faktor zur Einkaufsmengeneinheit", dispoItem.Item.nBesMehFaktor_Alief, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Mindestbestellmenge", dispoItem.Item.nMindestBestellmenge, 3, -999);
+                    rep.CreateReportingTableRowDecimal("Bestellvorschlagsmenge", dispoItem.Item.BestellvorschlagsMenge, 3, -999);
+                    rep.CreateReportingTableRow("Dispokennzeichen", dispoItem.Item.sDispoKennzeichen, 3, -999);
+
+                    rep.CreateReportingTableRow("Verwendete Auffüllungsmethode", dispoItem.UsedCalculationType.GetStringValue(), 3, -999);
+                    rep.CreateReportingTableRow("Verwendete Berechnungsmethode", dispoItem.UsedInclusionType.GetStringValue(), 3, -999);
+
+                    rep.CreateReportingTableRowDouble2("Mindestbestand", dispoItem.MinimumStockLevel, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Meldebestand", dispoItem.MessageStockLevel, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Maximalbestand", dispoItem.MaximumStockLevel, 3, -999);
+                    rep.CreateReportingTableRowDouble2("Sicherheitsbestand", dispoItem.SecurityStockLevel, 3, -999);
+                    rep.CreateReportingTableRowDouble2("linearer Monatsverbrauch", dispoItem.LinearConsumptionQuantity, 3, -999);
+                    if (request.InclusionTypes.Contains(ExecuteDispoManagerInclusionEnum.DisponibelKleinerReichweite))
+                    {
+                        rep.CreateReportingTableRowDouble2("Reichweitengesamtverbrauch", dispoItem.RangeTotalConsumption, 3, -999);
+                        rep.CreateReportingTableRowDouble2("Reichweitendurchschnittsverbrauch", dispoItem.RangeAverageConsumption, 3, -999);
+                    }
+
+                    rep.CreateReportingTableRow("Artikel in anderem Profil mit Bestellfreigabe", dispoItem.ExistsInOtherProposal, 3, -999);
+                    rep.TableEnd();
+                    rep.CreateReportingCaption("Berechnung");
+                    rep.TableBegin();
+                    if (dispoItem.StockInfo.Count == 1) // dispoItem.TotalStockQuantity == dispoItem.StockQuantity
+                    {
+                        if (request.WithAllProjectStocks)
+                        {
+                            rep.CreateReportingTableRowDouble2("", "Lagerbestand ohne Projektlager", dispoItem.StockQuantity);
+                            rep.CreateReportingTableRowDouble2("+", "Lagerbestand auf Projektlagern", dispoItem.ProjectStockQuantity);
+                            rep.CreateReportingTableRowDouble2("=", "Lagerbestand inkl. Projektlagern", dispoItem.StockQuantity + dispoItem.ProjectStockQuantity);
+                        }
+                        else
+                            rep.CreateReportingTableRowDouble2("", "Lagerbestand", dispoItem.StockQuantity);
+                    }
+                    else
+                    {
+                        // Lagerbestände der selekltierten Läger
+                        string plusSign = "";
+                        foreach (var stockInfo in dispoItem.StockInfo)
+                        {
+                            if (stockInfo.Bestand != 0)
+                            {
+                                string reduced = "";
+                                if (stockInfo.IsStockQuantityReduced)
+                                    reduced = " (reduziert)";
+                                rep.CreateReportingTableRowDouble2(plusSign, "Lagerbestand am Lager " + stockInfo.Lager.ToString() + reduced, stockInfo.Bestand);
+                                plusSign = "+";
+                            }
+                        }
+
+                        // Lagerbestände über alle Lager
+                        rep.CreateReportingTableRowDouble2("=", "Gesamtlagerbestand über alle Läger", dispoItem.RealTotalStockQuantity);
+                    }
+
+                    // Umgebuchte Menge
+                    if (dispoItem.TransferedQuantity.HasValue)
+                    {
+                        //AL: 16.02.2016 CRM: 88345
+                        //Es darf nicht die gesamte bereits umgebuchte Menge verwendet werden - die bereits verbrauchten Mengen haben keinen Einfluss mehr
+                        rep.CreateReportingTableRowDouble2("-", "auf Produktionslager umgebuchte und noch nicht verbrauchte Menge", dispoItem.TransferedQuantity.Value);
+                        // Lagerbestände über alle Lager
+                        rep.CreateReportingTableRowDouble2("=", "rechnerischer Gesamtlagerbestand", dispoItem.TotalStockQuantity);
+                    }
+
+                    if (request.WithOpenOrders)
+                    {
+                        title = "offene Auftragsmenge";
+                        // Wenn die offene Auftragsmenge über ein Datum selektiert wurde dieses Dateum andrucken
+                        if (request.OrderDateTo.HasValue && request.OrderDateTo.Value != DateTime.MinValue)
+                            title += " bis zum " + request.OrderDateTo.Value.ToString("dd.MM.yyyy");
+
+                        rep.CreateReportingTableRowDouble2("-", title, dispoItem.OpenOrderQuantity);
+                    }
+                    if (request.WithPlannedOrders)
+                    {
+                        title = "offene Planauftragsmenge";
+                        if (request.OrderDateTo.HasValue && request.OrderDateTo.Value != DateTime.MinValue)
+                            title += " bis zum " + request.OrderDateTo.Value.ToString("dd.MM.yyyy");
+                        rep.CreateReportingTableRowDouble2("-", title, dispoItem.OpenPlannedOrderQuantity);
+                    }
+                    if (request.WithFrameOrders)
+                    {
+                        title = "offene Rahmenauftragsmenge";
+                        if (request.OrderDateTo.HasValue && request.OrderDateTo.Value != DateTime.MinValue)
+                            title += " bis zum " + request.OrderDateTo.Value.ToString("dd.MM.yyyy");
+                        rep.CreateReportingTableRowDouble2("-", title, dispoItem.OpenFrameOrderQuantity);
+                    }
+                    if (request.WithOpenAssemblyOrders)
+                    {
+                        rep.CreateReportingTableRowDouble2("-", "offene Fertigungsaufträge (Bauteile)", dispoItem.OpenAssemblyOrderQuantity);
+                        if (request.WithPlannedAssemblyOrders)
+                        {
+                            rep.CreateReportingTableRowDouble2("(i)", "davon Plan-Fertigungsaufträge (Bauteile)", dispoItem.OpenPlannedAssemblyOrderQuantity);
+                        }
+                    }
+                    rep.CreateReportingTableRowDouble2("=", "verfügbarer Bestand", dispoItem.AvailableQuantity);
+                    if (request.WithOpenPurchaseOrders && dispoItem.OpenPurchaseOrderQuantity > 0)
+                    {
+                        title = "offene Bestellmenge";
+                        if (request.PurchaseOrderDateTo.HasValue && request.PurchaseOrderDateTo.Value != DateTime.MinValue)
+                            title += " bis zum " + request.PurchaseOrderDateTo.Value.ToString("dd.MM.yyyy");
+                        rep.CreateReportingTableRowDouble2("+", title, dispoItem.OpenPurchaseOrderQuantity);
+                    }
+                    if (!systemSettings.PurchaseOrders.GelieferteMengeSofortAktualisieren && dispoItem.OpenGoodsReiceiptQuantity > 0)
+                    {
+                        title = "offene Wareneingangsmenge";
+                        rep.CreateReportingTableRowDouble2("+", title, dispoItem.OpenGoodsReiceiptQuantity);
+                    }
+                    if (request.NegativOrderQuantity)
+                    {
+                        title = "offene negative Auftragsmenge";
+                        // Wenn die offene Auftragsmenge über ein Datum selektiert wurde dieses Datum andrucken
+                        if (request.OrderDateTo.HasValue && request.OrderDateTo.Value != DateTime.MinValue)
+                            title += " bis zum " + request.OrderDateTo.Value.ToString("dd.MM.yyyy");
+
+                        rep.CreateReportingTableRowDouble2("+", title, dispoItem.OpenNegativOrderQuantity);
+                    }
+                    if (request.WithOpenStockTransfers)
+                    {
+                        title = "offene Umbuchungsmenge (Eingang)";
+                        rep.CreateReportingTableRowDouble2("+", title, dispoItem.OpenInStockTransferQuantity);
+                        title = "offene Umbuchungsmenge (Ausgang)";
+                        rep.CreateReportingTableRowDouble2("-", title, dispoItem.OpenOutStockTransferQuantity);
+                    }
+                    if (dispoItem.Item.bIstBaugruppe &&
+                        (request.WithOpenAssemblyOrders || request.AssemblyRequirementFromAssemblyOrders || request.AssemblyRequirementFromOrders)
+                        )
+                    {
+                        rep.CreateReportingTableRowDouble2("+", "offene Fertigungsaufträge (Baugruppe)", dispoItem.OpenAssemblyOrderQuantityForAG);
+
+                        if (request.WithPlannedAssemblyOrders)
+                        {
+                            rep.CreateReportingTableRowDouble2("(i)", "davon Plan-Fertigungsaufträge (Bauteile)", dispoItem.OpenPlannedAssemblyOrderQuantityForAG);
+                        }
+                    }
+                    rep.CreateReportingTableRowDouble2("=", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                    rep.TableEnd();
+                    rep.BlankLine();
+                    rep.TableBegin();
+
+                    switch (request.CalculationTypes[0])
+                    {
+                        case ExecuteDispoManagerCalculateEnum.AuffuellungAufMindestbestand:
+                            #region Meldebestand
+                            rep.CreateReportingTableRowDouble2("", "Mindestbestand", dispoItem.MinimumStockLevel);
+                            rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            #endregion
+                            break;
+
+                        case ExecuteDispoManagerCalculateEnum.AuffuellungAufMeldebestand:
+                            #region Meldebestand
+                            rep.CreateReportingTableRowDouble2("", "Meldebestand", dispoItem.MessageStockLevel);
+                            rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            #endregion
+                            break;
+
+                        case ExecuteDispoManagerCalculateEnum.AuffuellungAufMaximalbestand:
+                            #region Meldebestand
+                            rep.CreateReportingTableRowDouble2("", "Maximalbestand", dispoItem.MaximumStockLevel);
+                            rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            #endregion
+                            break;
+
+                        case ExecuteDispoManagerCalculateEnum.AuffuellungAufLinVerbrauch:
+                            #region linearer Verbrauch
+                            // Bedarf für X Wochen vom linearen Verbrauch
+                            if (request.WeeksForLinearConsumption.HasValue && !double.IsNaN(request.WeeksForLinearConsumption.Value))
+                            {
+                                rep.CreateReportingTableRowDouble2("", "linearer Monatsverbrauch", dispoItem.LinearConsumptionQuantity);
+                                rep.CreateReportingTableRowDouble2("/", "Wochen je Monat", 4.00);
+                                rep.CreateReportingTableRowDouble2("=", "linearer Wochenverbrauch", dispoItem.LinearConsumptionQuantity / 4.00);
+                                rep.CreateReportingTableRowDouble2("*", "Anzahl WochenBedarf", request.WeeksForLinearConsumption.Value);
+                                rep.CreateReportingTableRowDouble2("=", "Gesamtbedarf für " + request.WeeksForLinearConsumption.Value.ToString("#0") + " Wochen", dispoItem.LinearConsumptionQuantity / 4.00 * request.WeeksForLinearConsumption.Value);
+                                rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            }
+                            else
+                            {
+                                rep.CreateReportingTableRowDouble2("", "linearer Gesamtverbrauch", dispoItem.TotalLinearConsumptionQuantity);
+                                rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            }
+                            #endregion
+                            break;
+                        case ExecuteDispoManagerCalculateEnum.AuffuellungAufReichweite:
+                            #region Reichweite
+                            rep.CreateReportingTableRowDouble2("", "Reichweitenbedarf", dispoItem.UpToRangeQuantity);
+                            rep.CreateReportingTableRowDouble2("-", "disponibler Bestand", dispoItem.DisponibleQuantity);
+                            #endregion
+                            break;
+                    }
+
+                    title = "Bestellvorschlagsmenge";
+                    if (dispoItem.IsIncreasedUpToMinimumOrderQuantity && !dispoItem.IsIncreasedUpToOptimalOrderQuantity)
+                    {
+                        string title2 = title;
+                        if (dispoItem.IsRoundedUpToWholeUnit)
+                            title2 += " (auf Ganze Mengeneinheit " + dispoItem.Item.sGanzeMengeneinheit + " aufgerundet)";
+                        title = title2 + " (vor Erhöhung auf Mindestbestellmenge)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantityBeforeIncreaseUpToMinOQ);
+                        title = title2 + " (auf Mindestbestellmenge erhöht)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantity);
+                    }
+                    else if (!dispoItem.IsIncreasedUpToMinimumOrderQuantity && dispoItem.IsIncreasedUpToOptimalOrderQuantity)
+                    {
+                        string title2 = title;
+                        if (dispoItem.IsRoundedUpToWholeUnit)
+                            title2 += " (auf Ganze Mengeneinheit " + dispoItem.Item.sGanzeMengeneinheit + " aufgerundet)";
+                        title = title2 + " (vor Erhöhung auf optimale Bestellmenge)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantityBeforeIncreaseUpToOptOQ);
+                        title = title2 + " (auf optimale Bestellmenge erhöht)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantity);
+                    }
+                    else if (dispoItem.IsIncreasedUpToMinimumOrderQuantity && dispoItem.IsIncreasedUpToOptimalOrderQuantity)
+                    {
+                        string title2 = title;
+                        if (dispoItem.IsRoundedUpToWholeUnit)
+                            title2 += " (auf Ganze Mengeneinheit " + dispoItem.Item.sGanzeMengeneinheit + " aufgerundet)";
+
+                        title = title2 + " (vor Erhöhung auf Mindestbestellmenge)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantityBeforeIncreaseUpToMinOQ);
+                        title = title2 + " (vor Erhöhung auf optimale Bestellmenge)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantityBeforeIncreaseUpToOptOQ);
+                        title = title2 + " (auf optimale Bestellmenge erhöht)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantity);
+                    }
+                    else
+                    {
+                        if (dispoItem.IsRoundedUpToWholeUnit)
+                            title += " (auf Ganze Mengeneinheit " + dispoItem.Item.sGanzeMengeneinheit + " aufgerundet)";
+                        rep.CreateReportingTableRowDouble2("=", title, dispoItem.ProposalQuantity);
+                    }
+                    rep.TableEnd();
+
+                    // Projektlagerdetails
+                    if (request.WithAllProjectStocks)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_ProjectStockDetails";
+                        rep.ProjectStockDetailsStart(id, "Bestände auf den Projektlagern");
+                        foreach (ProjectStockInfo projectStockInfo in dispoItem.ProjectStockInfo)
+                        {
+                            rep.ProjectStockDetail(projectStockInfo.ProjektLager, projectStockInfo.Bezeichnung, projectStockInfo.Bestand);
+                        }
+
+                        rep.ProjectStockDetailsEnd();
+                    }
+
+                    // Reichweitendetails
+                    if (request.InclusionTypes[0] == ExecuteDispoManagerInclusionEnum.DisponibelKleinerReichweite)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_RangeDetails";
+                        rep.RangeDetailsStart(id, "Verbrauchswochen für Reichweitenberechnung");
+                        foreach (StockInfo stockInfo in dispoItem.StockInfo)
+                        {
+                            if (stockInfo.RangeInfo != null)
+                            {
+                                for (int i = 0; i < stockInfo.RangeInfo.WochenVerbrauch.Length; i++)
+                                {
+                                    rep.RangeDetail(stockInfo.RangeInfo.WochenVerbrauch[i].Week, stockInfo.RangeInfo.WochenVerbrauch[i].Consumption,
+                                        stockInfo.RangeInfo.WochenVerbrauch[i].Weighting);
+                                }
+                            }
+                        }
+
+                        rep.RangeDetailsEnd();
+                    }
+
+                    // Auftragsdetails
+                    if (request.WithOpenOrders && dispoItem.StockInfo != null && dispoItem.StockInfo.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_OrderDetails";
+                        rep.OrderDetailsStart(id, "Berechnung der offenen Auftragsmenge",
+                            request.AssemblyRequirementFromOrders, request.WithStockQuantities, request.WithOpenPurchaseOrders, request.StockRelatedAssemblyOrder);
+                        foreach (StockInfo stockInfo in dispoItem.StockInfo)
+                        {
+                            if (stockInfo.OpenOrderQuantities != null && stockInfo.OpenOrderQuantities.Count > 0)
+                            {
+                                foreach (OpenOrderQuantity openOrderQuantity in stockInfo.OpenOrderQuantities)
+                                    rep.OrderDetail(openOrderQuantity.OrderNumber, openOrderQuantity.OrderDate, openOrderQuantity.APosInx,
+                                        openOrderQuantity.StockNumber, openOrderQuantity.OrderQuantity, openOrderQuantity.DeliveredQuantity,
+                                        openOrderQuantity.CommissionedQuantity,
+                                        openOrderQuantity.OpenQuantity, openOrderQuantity.DeliveryDate, openOrderQuantity.CustomerNumber,
+                                        openOrderQuantity.IsNegativQuantity, openOrderQuantity.IsSubAssemlyItem, openOrderQuantity.IsLockedOrder,
+                                        openOrderQuantity.IsAssemblyOrderExists, openOrderQuantity.AssemblyOrderQuantity, openOrderQuantity.StockRelatedAssemblyOrderQuantity);
+                            }
+                        }
+                        rep.OrderDetailsEnd();
+                    }
+
+                    // Bestelldetails
+                    if (request.WithOpenPurchaseOrders && dispoItem.StockInfo != null && dispoItem.StockInfo.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_PurchaseOrderDetails";
+                        rep.PurchaseOrderDetailsStart(id, "Berechnung der offenen Bestellmenge", null, null, null);
+                        foreach (StockInfo stockInfo in dispoItem.StockInfo)
+                        {
+                            // Bestelldetails
+                            if (stockInfo.OpenPurchaseOrderQuantities != null && stockInfo.OpenPurchaseOrderQuantities.Count > 0)
+                            {
+                                foreach (OpenPurchaseOrderQuantity openPurchaseOrderQuantity in stockInfo.OpenPurchaseOrderQuantities)
+                                    rep.PurchaseOrderDetail(openPurchaseOrderQuantity.OrderNumber, openPurchaseOrderQuantity.OrderDate, openPurchaseOrderQuantity.BePosInx,
+                                        openPurchaseOrderQuantity.StockNumber, openPurchaseOrderQuantity.OrderQuantity, openPurchaseOrderQuantity.DeliveredQuantity,
+                                        openPurchaseOrderQuantity.OpenQuantity, openPurchaseOrderQuantity.IncomingQuantity, openPurchaseOrderQuantity.SupplierNumber,
+                                        openPurchaseOrderQuantity.IsFrameOrder);
+                            }
+                        }
+                        rep.OrderDetailsEnd();
+                    }
+
+                    // Wareneingangdetails
+                    if (dispoItem.StockInfo != null && dispoItem.StockInfo.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_GoodsReceiptDetails";
+                        rep.GoodsReceiptDetailStart(id, "offene Wareneingänge");
+                        foreach (StockInfo stockInfo in dispoItem.StockInfo)
+                        {
+                            // Bestelldetails
+                            if (stockInfo.OpenGoodsReceiptQuantities != null && stockInfo.OpenGoodsReceiptQuantities.Count > 0)
+                            {
+                                foreach (OpenGoodsReceiptQuantity openGoodsReceiptQuantity in stockInfo.OpenGoodsReceiptQuantities)
+                                    rep.GoodsReceiptDetail(openGoodsReceiptQuantity.PurchaseDeliveryNoteNumber, openGoodsReceiptQuantity.PurchaseDeliveryNoteDate,
+                                        openGoodsReceiptQuantity.SupplierNumber, openGoodsReceiptQuantity.WePosInx, openGoodsReceiptQuantity.StockNumber,
+                                        openGoodsReceiptQuantity.Quantity, openGoodsReceiptQuantity.PurchaseOrderNumber, openGoodsReceiptQuantity.BePosInx);
+                            }
+                        }
+                        rep.OrderDetailsEnd();
+                    }
+
+                    // Details zu Fertigungsaufträgen (Baugruppen)
+                    if (dispoItem.OpenAssemblyOrders != null && dispoItem.OpenAssemblyOrders.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_AssemblyOrderQuantitiesHeader";
+                        rep.AssemblyOrderDetailsStart(id, "Berechnung der offenen Fertigungsaufträge (Baugruppen)", Reporting.Reporting.OrderTypeEnum.OpenAssemblyOrderHeader);
+                        foreach (OpenAssemblyOrder openAssemblyOrder in dispoItem.OpenAssemblyOrders)
+                            rep.AssemblyOrderDetail(Reporting.Reporting.OrderTypeEnum.OpenAssemblyOrderHeader,
+                                openAssemblyOrder.AssemblyOrderNumber, openAssemblyOrder.AssemblyOrderType, openAssemblyOrder.AssemblyOrderIndex,
+                                openAssemblyOrder.OrganisationUnit.Value, openAssemblyOrder.SupplierNumber,
+                                openAssemblyOrder.IsForeignAssemblyOrder, double.NaN,
+                                openAssemblyOrder.AssemblyOrderQuantity, openAssemblyOrder.ProducedQuantity, null, openAssemblyOrder.OpenQuantity,
+                                openAssemblyOrder.IsOrderApproval, openAssemblyOrder.IsPlannedAssemblyOrder);
+                        rep.OrderDetailsEnd();
+                    }
+
+                    // Details zu Fertigungsaufträgen (Positionen)
+                    if (dispoItem.OpenAssemblyOrderQuantities != null && dispoItem.OpenAssemblyOrderQuantities.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_AssemblyOrderQuantitiesPositions";
+                        rep.AssemblyOrderDetailsStart(id, "Berechnung der offenen Fertigungsaufträge (Bestandteile)", Reporting.Reporting.OrderTypeEnum.OpenAssemblyOrderPosition);
+                        foreach (OpenAssemblyOrderQuantity openAssemblyOrderQuantity in dispoItem.OpenAssemblyOrderQuantities)
+                            rep.AssemblyOrderDetail(Reporting.Reporting.OrderTypeEnum.OpenAssemblyOrderPosition,
+                                openAssemblyOrderQuantity.AssemblyOrderNumber, openAssemblyOrderQuantity.AssemblyOrderType, openAssemblyOrderQuantity.AssemblyOrderIndex,
+                                openAssemblyOrderQuantity.OrganisationUnit.Value, openAssemblyOrderQuantity.SupplierNumber,
+                                openAssemblyOrderQuantity.IsForeignAssemblyOrder, openAssemblyOrderQuantity.StockNumber,
+                                openAssemblyOrderQuantity.PlannedQuantity, openAssemblyOrderQuantity.ProducedQuantity,
+                                openAssemblyOrderQuantity.TransferedQuantity, openAssemblyOrderQuantity.OpenQuantity,
+                                openAssemblyOrderQuantity.IsOrderApproval, openAssemblyOrderQuantity.IsPlannedAssemblyOrder);
+                        rep.OrderDetailsEnd();
+                    }
+
+                    // Bedarf durch andere Lager decken
+                    if (dispoItem.TransferFromStocks != null && dispoItem.TransferFromStocks.Count > 0)
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_Stock" + dispoItem.StockNumber.ToString() + "_TransferFromStocksPositions";
+                        rep.TransferFromStocksStart(id, "Bedarfsdeckung durch andere Lager");
+                        foreach (TransferFromStock stock in dispoItem.TransferFromStocks)
+                            rep.TransferFromStocksDetail(stock.Lager, stock.Verfuegbar, stock.Umbuchungsmenge, stock.Dispokennzeichen);
+                        rep.TransferFromStocksEnd();
+                    }
+
+                    // Artikel in offenen Projektumbuchungsvorschlägen
+                    if (request.WithoutOpenProjectStockTransfers && dispoItem.OpenProjectStockTransfers.HasValues())
+                    {
+                        string id = "Item" + dispoItem.Item.sArtikelnummer + "_OpenProjectStockTransfers";
+                        rep.OpenProjectStockTransferStart(id, "Offenen Projektumbuchungsvorschläge");
+                        foreach (OpenProjectStockTransfer opst in dispoItem.OpenProjectStockTransfers)
+                            rep.OpenProjectStockTransferDetail(opst.ProposalNumber, opst.OrderNumber, opst.ProjectNumber, opst.OpenQuantity, opst.TransferQuantity,
+                                opst.QuantityUnit, opst.StockNumber, opst.StockLocationNumber);
+                        rep.OpenProjectStockTransferEnd();
+                    }
+
+                    rep.SectionEnd();
+
+                }
+                #endregion
+
+                rep.CloseReport();
+            }
+            #endregion
+
+            dispoItems = null;
+
+            dbConn.Commit();
+        }
+        catch
+        {
+            if (dbConn != null && dbConn.Transaction != null)
+                dbConn.Rollback();
+
+            throw;
+        }
+    }
+
+
+    return result;
+}
